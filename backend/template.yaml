@@ -10,6 +10,23 @@ Globals:
     Timeout: 3
 
 Resources:
+  # The Database (Always Free up to 25GB)
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SplitTrack_Transactions
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: transactionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: transactionId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST # Best for Free Tier
+
   RepairLogicFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -19,11 +36,18 @@ Resources:
       Architectures:
         - x86_64
 
+  # Updated Function with API Event
   UpdateTransactionFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/handlers/
       Handler: updateTransaction.handler
       Runtime: nodejs18.x
-      Architectures:
-        - x86_64
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TransactionsTable }
+      Events:
+        UpdateApi:
+          Type: Api
+          Properties:
+            Path: /update
+            Method: post
