@@ -1,0 +1,17 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - cd frontend      # Navigate specifically to the frontend folder
+        - npm ci           # Clean install for faster, reliable builds
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: dist    # Ensure this matches your Vite/React output folder
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/* # Caching node_modules saves build minutes
