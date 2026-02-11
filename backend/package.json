@@ -1,0 +1,14 @@
+{
+    "name": "splittrack-backend",
+    "version": "1.0.0",
+    "description": "Backend for SplitTrack",
+    "main": "src/handlers/index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "aws-sdk": "^2.1000.0"
+    }
+}

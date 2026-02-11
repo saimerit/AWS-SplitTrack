@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  splittrack-backend
+
+  Sample SAM Template for splittrack-backend
+
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  RepairLogicFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: repairLogic.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+
+  UpdateTransactionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: updateTransaction.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
