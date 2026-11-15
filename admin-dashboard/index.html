@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>SplitTrack Admin</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main>
+      <header><h1>SplitTrack Admin</h1><p>Publish a user-facing release note before sending an Expo update.</p></header>
+      <section class="card">
+        <label>API URL <input id="apiUrl" placeholder="https://…execute-api…amazonaws.com"></label>
+        <label>Admin key <input id="adminKey" type="password" placeholder="SSM admin key"></label>
+        <button id="refresh">Load changelog</button>
+      </section>
+      <section class="card">
+        <h2>Publish release note</h2>
+        <form id="releaseForm">
+          <label>Version <input id="version" required placeholder="1.2.0"></label>
+          <label>Update message <input id="message" required placeholder="Improved shared-expense calculations"></label>
+          <label>Notes (one per line)<textarea id="notes" rows="5" placeholder="Fixed balance rounding&#10;Improved offline sync"></textarea></label>
+          <button>Publish changelog</button>
+        </form>
+      </section>
+      <section class="card"><h2>Published releases</h2><div id="status"></div><ol id="releases"></ol></section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>

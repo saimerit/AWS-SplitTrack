@@ -1,14 +1,19 @@
 {
-    "name": "splittrack-backend",
-    "version": "1.0.0",
-    "description": "Backend for SplitTrack",
-    "main": "src/handlers/index.js",
-    "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1"
-    },
-    "author": "",
-    "license": "ISC",
-    "dependencies": {
-        "aws-sdk": "^2.1000.0"
-    }
+  "name": "splittrack-backend",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AWS serverless API and administration endpoints for SplitTrack.",
+  "scripts": {
+    "test": "node --test test/ledger.test.js test/auth.test.js",
+    "test:floci": "node --test test/floci.integration.test.js",
+    "validate": "npm run test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1018.0",
+    "@aws-sdk/lib-dynamodb": "^3.1018.0"
+  }
 }

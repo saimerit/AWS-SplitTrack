@@ -1,0 +1,11 @@
+services:
+  floci:
+    image: floci/floci:latest-compat
+    ports:
+      - "4566:4566"
+    environment:
+      FLOCI_STORAGE_MODE: persistent
+    volumes:
+      - floci-data:/var/lib/floci
+volumes:
+  floci-data:

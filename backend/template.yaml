@@ -1,53 +1,233 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: >
-  splittrack-backend
-
-  Sample SAM Template for splittrack-backend
+Description: SplitTrack Production-Grade Serverless Backend (API Gateway, Lambda, DynamoDB)
 
 Globals:
   Function:
-    Timeout: 3
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        DATA_TABLE: !Ref SplitTrackDataTable
+        CHANGELOG_TABLE: !Ref SplitTrackChangelogTable
+        API_KEY: '{{resolve:ssm:/splittrack/api-key}}'
+        ADMIN_API_KEY: '{{resolve:ssm:/splittrack/admin-api-key}}'
+        JWT_SECRET: '{{resolve:ssm:/splittrack/jwt-secret}}'
+        CORS_ORIGIN: '*'
 
 Resources:
-  # The Database (Always Free up to 25GB)
-  TransactionsTable:
+  SplitTrackApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - content-type
+          - x-user-id
+          - x-api-key
+          - x-admin-key
+          - authorization
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+
+  SplitTrackDataTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: SplitTrack_Transactions
+      TableName: SplitTrackData
+      BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: userId
           AttributeType: S
-        - AttributeName: transactionId
+        - AttributeName: recordId
           AttributeType: S
       KeySchema:
         - AttributeName: userId
           KeyType: HASH
-        - AttributeName: transactionId
+        - AttributeName: recordId
           KeyType: RANGE
-      BillingMode: PAY_PER_REQUEST # Best for Free Tier
 
-  RepairLogicFunction:
+  SplitTrackChangelogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SplitTrackChangelog
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: releaseId
+          AttributeType: S
+        - AttributeName: publishedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: releaseId
+          KeyType: HASH
+        - AttributeName: publishedAt
+          KeyType: RANGE
+
+  StateFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/handlers/
-      Handler: repairLogic.handler
-      Runtime: nodejs18.x
-      Architectures:
-        - x86_64
-
-  # Updated Function with API Event
-  UpdateTransactionFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: src/handlers/
-      Handler: updateTransaction.handler
-      Runtime: nodejs18.x
+      CodeUri: src/
+      Handler: handlers/state.handler
       Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref TransactionsTable }
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SplitTrackDataTable
       Events:
-        UpdateApi:
-          Type: Api
+        ReadState:
+          Type: HttpApi
           Properties:
-            Path: /update
-            Method: post
+            ApiId: !Ref SplitTrackApi
+            Path: /state
+            Method: GET
+        SyncStatePut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /state
+            Method: PUT
+        SyncStatePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /state
+            Method: POST
+        DeleteState:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /state
+            Method: DELETE
+        EraseState:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /state/erase
+            Method: POST
+        WriteEntity:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: '/entities/{entityType}/{entityId}'
+            Method: PUT
+        DeleteEntity:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: '/entities/{entityType}/{entityId}'
+            Method: DELETE
+        GetTransactions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /transactions
+            Method: GET
+        GetTransaction:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: '/transactions/{transactionId}'
+            Method: GET
+        AddTransaction:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /transactions
+            Method: POST
+        BatchTransactions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /transactions/batch
+            Method: POST
+        DeleteTransaction:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: '/transactions/{transactionId}'
+            Method: DELETE
+
+  ChangelogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/changelog.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SplitTrackChangelogTable
+      Events:
+        ListChangelog:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /changelog
+            Method: GET
+        PublishChangelog:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /admin/changelog
+            Method: POST
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/health.handler
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /health
+            Method: GET
+
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/auth.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SplitTrackDataTable
+      Events:
+        Signup:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /auth/signup
+            Method: POST
+        Signin:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /auth/signin
+            Method: POST
+        GoogleAuth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /auth/google
+            Method: POST
+        GetMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SplitTrackApi
+            Path: /auth/me
+            Method: GET
+
+Outputs:
+  ApiUrl:
+    Description: SplitTrack HTTP API Gateway Base URL
+    Value: !Sub 'https://${SplitTrackApi}.execute-api.${AWS::Region}.amazonaws.com'
+  DataTableName:
+    Description: DynamoDB Data Table Name
+    Value: !Ref SplitTrackDataTable
+  ChangelogTableName:
+    Description: DynamoDB Changelog Table Name
+    Value: !Ref SplitTrackChangelogTable
