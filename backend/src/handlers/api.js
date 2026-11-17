@@ -9,6 +9,7 @@ import {
   bulkUpdateTransactions,
   rectifyAllStats,
   repairAllTransactionStats,
+  settleAllTransactions,
 } from '../services/transactionService.js';
 import {
   getRecurringRules,
@@ -63,7 +64,14 @@ export async function handler(event) {
     const ledgerScope = userId.startsWith('USER#') ? userId.slice(5) : userId;
 
     // Run in requestContextStorage to enforce user isolation across all services
-    return await requestContextStorage.run({ ledgerId: ledgerScope, userId: ledgerScope }, async () => {
+    const existingStore = requestContextStorage.getStore();
+    const contextData = {
+      ledgerId: ledgerScope,
+      userId: ledgerScope,
+      ...(existingStore?.adapter ? { adapter: existingStore.adapter } : {}),
+    };
+
+    return await requestContextStorage.run(contextData, async () => {
       // -----------------------------------------------------------------------
       // 1. TRANSACTIONS ROUTES
       // -----------------------------------------------------------------------
@@ -144,6 +152,23 @@ export async function handler(event) {
         const id = permMatch[1];
         const result = await permanentDeleteTransaction(id);
         return ok(result);
+      }
+
+      // Settle all / full settle: POST /api/transactions/settle-all
+      if (
+        (normalizedPath === '/api/transactions/settle-all' ||
+          normalizedPath === '/transactions/settle-all' ||
+          normalizedPath === '/api/transactions/settle-full' ||
+          normalizedPath === '/transactions/settle-full') &&
+        method === 'POST'
+      ) {
+        const body = parseBody(event);
+        const { participantId, ...rest } = body;
+        if (!participantId) {
+          return fail('participantId is required for full settlement.', 400);
+        }
+        const result = await settleAllTransactions({ participantId, ...rest });
+        return ok({ success: true, data: result }, 201);
       }
 
       // Single transaction: PUT /api/transactions/:id

@@ -545,3 +545,284 @@ export const repairAllTransactionStats = async () => {
   await rectifyAllStats();
   return { processed };
 };
+
+/**
+ * FULL SETTLE / ALL SETTLE:
+ * Collects all active transactions involving a participant, computes the net final amount
+ * taking into account what payee owes, what payee is owed, past partial payments, and past overpayments.
+ * Allows the payee to settle fully, partially, or overpay, settles previous transactions,
+ * and updates the current settlement transaction status to settled, partial, or overpay.
+ *
+ * @param {Object} options
+ * @param {string} options.participantId - Required ID of the participant / payee
+ * @param {number} [options.amount] - Payment amount (defaults to total net debt if omitted)
+ * @param {string} [options.payer] - Explicit payer ('me' or participantId; auto-detected by default)
+ * @param {string} [options.expenseName] - Optional custom title for settlement
+ * @param {string} [options.paymentMode] - Mode of payment ('UPI', 'Cash', 'Online')
+ * @param {string} [options.notes] - Optional note
+ * @param {string} [options.groupId] - Optional group ID
+ * @param {Date|string} [options.timestamp] - Optional date
+ * @returns {Promise<Object>} Created settlement transaction and updated balances
+ */
+export const settleAllTransactions = async ({
+  participantId,
+  amount,
+  payer: explicitPayer,
+  expenseName,
+  paymentMode = 'Online',
+  notes = '',
+  groupId = 'personal',
+  timestamp,
+}) => {
+  if (!participantId || participantId === 'me') {
+    throw new Error('A valid participantId is required for full settlement.');
+  }
+
+  const db = getDb();
+  const snap = await db.collection(COLLECTION_PATH)
+    .where("isDeleted", "==", false)
+    .get();
+
+  const transactions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+  // 1. Calculate the exact net balance between 'me' and participantId
+  // Positive (> 0): participant owes 'me'
+  // Negative (< 0): 'me' owes participant
+  let netBalance = 0;
+  const participantCandidateParents = [];
+
+  transactions.forEach(txn => {
+    const txnPayer = txn.payer || 'me';
+    const txnAmount = parseFloat(txn.amount) || 0;
+    const splits = txn.splits || {};
+
+    if (txn.type === 'income') return;
+
+    if (txn.isReturn) {
+      // Settlement / Return transaction
+      const recipient = txn.participants?.[0];
+      const settlingParticipant = txnPayer !== 'me' ? txnPayer : recipient;
+
+      if (settlingParticipant === participantId) {
+        if (txnPayer === 'me') {
+          // 'me' gave money to participant -> increases what participant owes 'me'
+          netBalance += txnAmount;
+        } else {
+          // participant gave money to 'me' -> decreases what participant owes 'me'
+          netBalance -= txnAmount;
+        }
+
+        // Check if this settlement transaction itself has an unsettled deficit or remaining credit
+        const deficit = parseFloat(txn.settlementDeficit) || 0;
+        const overpaid = parseFloat(txn.overpaidAmount) || 0;
+        const remaining = parseFloat(txn.remainingAmount) || 0;
+        if (deficit > 1 || remaining > 1 || overpaid < -1 || txn.settlementStatus === 'partial') {
+          participantCandidateParents.push(txn);
+        }
+      }
+    } else {
+      // Regular expense transaction
+      if (txnPayer === 'me') {
+        const share = splits[participantId];
+        if (share !== undefined && share !== null && Number(share) !== 0) {
+          netBalance += parseFloat(share);
+
+          // If not fully settled, it's a candidate to be marked settled
+          const rem = txn.participantRemaining?.[participantId] !== undefined
+            ? txn.participantRemaining[participantId]
+            : (txn.remainingAmount !== undefined ? txn.remainingAmount : share);
+          if (rem > 1 || txn.settlementStatus !== 'settled') {
+            participantCandidateParents.push(txn);
+          }
+        }
+      } else if (txnPayer === participantId) {
+        const myShare = splits['me'];
+        if (myShare !== undefined && myShare !== null && Number(myShare) !== 0) {
+          netBalance -= parseFloat(myShare);
+        } else {
+          // Entire amount paid by participant
+          netBalance -= txnAmount;
+        }
+
+        if (txn.settlementStatus !== 'settled') {
+          participantCandidateParents.push(txn);
+        }
+      }
+    }
+  });
+
+  // Sort candidate parents chronologically (oldest first) so older debts are settled first
+  participantCandidateParents.sort((a, b) => {
+    const tA = a.timestamp?.toDate ? a.timestamp.toDate().getTime() : new Date(a.timestamp || a.createdAt || 0).getTime();
+    const tB = b.timestamp?.toDate ? b.timestamp.toDate().getTime() : new Date(b.timestamp || b.createdAt || 0).getTime();
+    return tA - tB;
+  });
+
+  // 2. Determine who owes whom and total debt to settle
+  // If netBalance > 0: participant owes 'me'. Payer is participantId.
+  // If netBalance < 0: 'me' owes participant. Payer is 'me'.
+  // If netBalance == 0: no debt.
+  const totalDebtToSettle = Math.abs(netBalance);
+  const defaultPayer = netBalance >= 0 ? participantId : 'me';
+  const payer = explicitPayer || defaultPayer;
+
+  // 3. Determine Payment Amount
+  // If amount was not passed, settle the full net balance
+  let paymentAmount;
+  if (amount !== undefined && amount !== null) {
+    paymentAmount = parseFloat(amount);
+  } else {
+    paymentAmount = totalDebtToSettle;
+  }
+
+  if (isNaN(paymentAmount) || paymentAmount < 0) {
+    throw new Error('Settlement payment amount must be a non-negative number.');
+  }
+
+  // 4. Compute Deficit / Overpay Logic
+  // deficit = totalDebtToSettle - paymentAmount
+  // If deficit > 5 => Partial settlement
+  // If deficit < -5 => Overpayment
+  // If |deficit| <= 5 => Full settlement
+  const deficit = totalDebtToSettle - paymentAmount;
+
+  let settlementStatus = 'settled';
+  let settlementDeficit = 0;
+  let remainingAmount = 0;
+  let overpaidAmount = 0;
+  let participantRemaining = { [participantId]: 0 };
+  let participantStatuses = { [participantId]: 'settled' };
+  let participantOverpaid = {};
+  let initialOverpaidAmount = 0;
+  let initialParticipantOverpaid = {};
+
+  if (deficit > 5) {
+    // PARTIAL PAYMENT
+    settlementStatus = 'partial';
+    settlementDeficit = deficit;
+    remainingAmount = deficit;
+    overpaidAmount = 0;
+    participantRemaining = { [participantId]: deficit };
+    participantStatuses = { [participantId]: 'partial' };
+  } else if (deficit < -5) {
+    // OVERPAYMENT
+    const overpaid = Math.abs(deficit);
+    settlementStatus = 'settled';
+    settlementDeficit = 0;
+    remainingAmount = 0;
+    overpaidAmount = -overpaid;
+    initialOverpaidAmount = -overpaid;
+    participantRemaining = { [participantId]: -overpaid };
+    participantStatuses = { [participantId]: 'overpaid' };
+    participantOverpaid = { [participantId]: -overpaid };
+    initialParticipantOverpaid = { [participantId]: -overpaid };
+  } else {
+    // FULL SETTLEMENT
+    settlementStatus = 'settled';
+    settlementDeficit = 0;
+    remainingAmount = 0;
+    overpaidAmount = 0;
+    participantRemaining = { [participantId]: 0 };
+    participantStatuses = { [participantId]: 'settled' };
+  }
+
+  // 5. Allocate Funds Across Candidate Parent Transactions (FIFO order)
+  let fundsLeft = paymentAmount;
+  const linkedTransactions = [];
+  const parentTransactionIds = [];
+
+  for (const parent of participantCandidateParents) {
+    parentTransactionIds.push(parent.id);
+
+    // Determine how much is needed to settle this parent for participantId
+    let needed = 0;
+    if (parent.participantRemaining && parent.participantRemaining[participantId] !== undefined) {
+      needed = Math.max(0, parseFloat(parent.participantRemaining[participantId]) || 0);
+    } else if (parent.remainingAmount !== undefined) {
+      needed = Math.max(0, parseFloat(parent.remainingAmount) || 0);
+    } else if (parent.splits && parent.splits[participantId]) {
+      needed = Math.max(0, parseFloat(parent.splits[participantId]) || 0);
+    } else {
+      needed = parseFloat(parent.amount) || 0;
+    }
+
+    const allocated = Math.min(fundsLeft, needed);
+    linkedTransactions.push({
+      id: parent.id,
+      amount: allocated,
+      originalAmount: parent.amount,
+    });
+
+    fundsLeft = Math.max(0, fundsLeft - allocated);
+  }
+
+  // 6. Build the Settlement Transaction Document
+  const createdAt = Timestamp.now();
+  const txnTimestamp = timestamp
+    ? (timestamp instanceof Timestamp ? timestamp : Timestamp.fromDate(new Date(timestamp)))
+    : createdAt;
+
+  const defaultTitle = deficit > 5
+    ? `Partial Settlement with ${participantId}`
+    : (deficit < -5 ? `Overpayment Settlement with ${participantId}` : `Full Settlement with ${participantId}`);
+
+  const finalDocData = {
+    expenseName: expenseName || defaultTitle,
+    amount: paymentAmount,
+    category: 'Settlement',
+    type: 'settlement',
+    isReturn: true,
+    payer,
+    participants: [participantId],
+    timestamp: txnTimestamp,
+    createdAt,
+    modeOfPayment: paymentMode,
+    notes,
+    groupId,
+    isDeleted: false,
+    parentTransactionIds,
+    linkedTransactions,
+    settlementStatus,
+    settlementDeficit,
+    remainingAmount,
+    overpaidAmount,
+    participantRemaining,
+    participantStatuses,
+    ...(overpaidAmount < 0 ? {
+      initialOverpaidAmount,
+      participantOverpaid,
+      initialParticipantOverpaid,
+    } : {}),
+  };
+
+  // 7. Save the Settlement Transaction to Database
+  const docRef = await db.collection(COLLECTION_PATH).add(finalDocData);
+  const createdSettlement = { id: docRef.id, ...finalDocData };
+
+  // 8. Update Parent Transactions
+  if (parentTransactionIds.length > 0) {
+    await Promise.all(parentTransactionIds.map(pid => updateParentStats(pid)));
+  }
+
+  // 9. Recompute Balances Across Entire Ledger
+  const rectifiedStats = await rectifyAllStats([{ uniqueId: participantId, name: participantId }]);
+
+  return {
+    ...createdSettlement,
+    summary: {
+      participantId,
+      netBalanceBefore: netBalance,
+      totalDebtToSettle,
+      paymentAmount,
+      settlementStatus,
+      deficit,
+      overpaidAmount,
+      settledParentCount: parentTransactionIds.length,
+      currentNetBalance: rectifiedStats?.myPersonalBalances?.[participantId] ?? 0,
+    }
+  };
+};
+
+export const fullSettleTransactions = settleAllTransactions;
+export const allSettleTransactions = settleAllTransactions;
+

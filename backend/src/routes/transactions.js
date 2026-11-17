@@ -7,7 +7,8 @@ import {
   permanentDeleteTransaction,
   bulkUpdateTransactions,
   rectifyAllStats,
-  repairAllTransactionStats
+  repairAllTransactionStats,
+  settleAllTransactions,
 } from '../services/transactionService.js';
 import { getDb, LEDGER_ID } from '../config/firebase.js';
 
@@ -125,6 +126,34 @@ router.post('/repair', async (req, res) => {
   try {
     const result = await repairAllTransactionStats();
     res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/transactions/settle-all (full/all settle)
+router.post('/settle-all', async (req, res) => {
+  try {
+    const { participantId, ...rest } = req.body;
+    if (!participantId) {
+      return res.status(400).json({ success: false, error: 'participantId is required for full settle' });
+    }
+    const result = await settleAllTransactions({ participantId, ...rest });
+    res.status(201).json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/transactions/settle-full (alias)
+router.post('/settle-full', async (req, res) => {
+  try {
+    const { participantId, ...rest } = req.body;
+    if (!participantId) {
+      return res.status(400).json({ success: false, error: 'participantId is required for full settle' });
+    }
+    const result = await settleAllTransactions({ participantId, ...rest });
+    res.status(201).json({ success: true, data: result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
