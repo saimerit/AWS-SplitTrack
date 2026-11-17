@@ -5,7 +5,7 @@ The Expo app (`frontend/`) uses an offline-first architecture powered by `@react
 ## Environment Variables (`frontend/.env`)
 
 ```ini
-EXPO_PUBLIC_API_URL=https://cwzc799nji.execute-api.ap-south-1.amazonaws.com
+EXPO_PUBLIC_API_URL=<YOUR_API_GATEWAY_URL>
 EXPO_PUBLIC_API_KEY=<YOUR_SPLITTRACK_API_KEY>
 EXPO_PUBLIC_USER_ID=user_sobha
 ```

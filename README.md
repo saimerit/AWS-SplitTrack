@@ -4,10 +4,10 @@ Production-grade, ultra-cost-optimized AWS serverless backend and offline-first 
 
 ## Deployed Architecture & Endpoints
 
-- **API Base URL**: `https://cwzc799nji.execute-api.ap-south-1.amazonaws.com`
+- **API Base URL**: `<YOUR_API_GATEWAY_URL>`
 - **Region**: `ap-south-1` (Mumbai)
 - **API Key**: `<YOUR_SPLITTRACK_API_KEY>`
-- **Admin Key (SSM `/splittrack/admin-api-key`)**: `fb213c671d6e3b1515b72e4c63e24d3304131cf7960fde08`
+- **Admin Key (SSM `/splittrack/admin-api-key`)**: `<YOUR_SPLITTRACK_ADMIN_KEY>`
 - **DynamoDB Data Table**: `SplitTrackData` (Pay-per-request, On-Demand)
 - **DynamoDB Changelog Table**: `SplitTrackChangelog` (Pay-per-request, On-Demand)
 
@@ -30,7 +30,7 @@ Production-grade, ultra-cost-optimized AWS serverless backend and offline-first 
 
 1. Ensure `frontend/.env` contains:
    ```ini
-   EXPO_PUBLIC_API_URL=https://cwzc799nji.execute-api.ap-south-1.amazonaws.com
+   EXPO_PUBLIC_API_URL=<YOUR_API_GATEWAY_URL>
    EXPO_PUBLIC_API_KEY=<YOUR_SPLITTRACK_API_KEY>
    EXPO_PUBLIC_USER_ID=user_sobha
    ```

@@ -23,7 +23,7 @@ Globals:
         CORS_ORIGIN: '*'
 
 Resources:
-  SplitTrackApi:
+  SplitTrackHttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       CorsConfiguration:
@@ -160,43 +160,43 @@ Resources:
         ApiProxy:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /api/{proxy+}
             Method: ANY
         ApiRoot:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /api
             Method: ANY
         RecurringProxy:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /recurring/{proxy+}
             Method: ANY
         RecurringRoot:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /recurring
             Method: ANY
         TemplatesProxy:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /templates/{proxy+}
             Method: ANY
         TemplatesRoot:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /templates
             Method: ANY
         AdminProxy:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /admin/{proxy+}
             Method: ANY
 
@@ -220,73 +220,73 @@ Resources:
         ReadState:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /state
             Method: GET
         SyncStatePut:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /state
             Method: PUT
         SyncStatePost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /state
             Method: POST
         DeleteState:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /state
             Method: DELETE
         EraseState:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /state/erase
             Method: POST
         WriteEntity:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: '/entities/{entityType}/{entityId}'
             Method: PUT
         DeleteEntity:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: '/entities/{entityType}/{entityId}'
             Method: DELETE
         GetTransactions:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /transactions
             Method: GET
         GetTransaction:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: '/transactions/{transactionId}'
             Method: GET
         AddTransaction:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /transactions
             Method: POST
         BatchTransactions:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /transactions/batch
             Method: POST
         DeleteTransaction:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: '/transactions/{transactionId}'
             Method: DELETE
 
@@ -302,13 +302,13 @@ Resources:
         ListChangelog:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /changelog
             Method: GET
         PublishChangelog:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /admin/changelog
             Method: POST
 
@@ -321,7 +321,7 @@ Resources:
         Health:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /health
             Method: GET
 
@@ -337,32 +337,32 @@ Resources:
         Signup:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /auth/signup
             Method: POST
         Signin:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /auth/signin
             Method: POST
         GoogleAuth:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /auth/google
             Method: POST
         GetMe:
           Type: HttpApi
           Properties:
-            ApiId: !Ref SplitTrackApi
+            ApiId: !Ref SplitTrackHttpApi
             Path: /auth/me
             Method: GET
 
 Outputs:
   ApiUrl:
     Description: SplitTrack HTTP API Gateway Base URL
-    Value: !Sub 'https://${SplitTrackApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Value: !Sub 'https://${SplitTrackHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
   DataTableName:
     Description: DynamoDB Data Table Name
     Value: !Ref SplitTrackDataTable
