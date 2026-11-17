@@ -1,0 +1,17 @@
+{
+  "name": "splittrack-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "terminal": "node scripts/terminal.js",
+    "inspect": "node scripts/inspect_transaction.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "firebase-admin": "^13.6.0"
+  }
+}

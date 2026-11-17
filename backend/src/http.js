@@ -77,3 +77,11 @@ export const verifyApiKey = (event) => {
 
   return false;
 };
+
+export const verifyAdminKey = (event) => {
+  const expectedAdmin = process.env.ADMIN_API_KEY;
+  if (!expectedAdmin) return true; // Open if unconfigured
+  const adminKey = getHeader(event.headers, 'x-admin-key') || event.queryStringParameters?.adminKey;
+  return adminKey === expectedAdmin;
+};
+
