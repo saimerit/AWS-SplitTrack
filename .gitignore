@@ -39,6 +39,9 @@ packaged.yaml
 **/packaged.yaml
 *.packaged.yaml
 .serverless/
+.work/
+backend/.build/
+backend/.deployment/
 *.tfstate
 *.tfstate.backup
 

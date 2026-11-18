@@ -1,50 +1,58 @@
 # Frontend to Backend Mapping
 
-The Expo app (`frontend/`) uses an offline-first architecture powered by `@react-native-async-storage/async-storage` with automatic, non-blocking cloud persistence to AWS DynamoDB via `frontend/src/services/splitTrackApi.ts`.
+The separate Expo repository uses `src/auth/AuthContext.tsx` for Firebase sessions, `src/services/api.ts` for authenticated AWS requests and `src/store/SplitTrackStore.tsx` for real cloud state. Snapshots are scoped to the signed-in Firebase UID.
 
 ## Environment Variables (`frontend/.env`)
 
 ```ini
-EXPO_PUBLIC_API_URL=<YOUR_API_GATEWAY_URL>
-EXPO_PUBLIC_API_KEY=<YOUR_SPLITTRACK_API_KEY>
-EXPO_PUBLIC_USER_ID=user_sobha
+EXPO_PUBLIC_API_URL=https://e3kt7e3dag.execute-api.ap-south-1.amazonaws.com
+EXPO_PUBLIC_FIREBASE_API_KEY=
+EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN=
+EXPO_PUBLIC_FIREBASE_PROJECT_ID=
+EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET=
+EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=
+EXPO_PUBLIC_FIREBASE_APP_ID=
+EXPO_PUBLIC_GOOGLE_PLACES_API_KEY=
 ```
 
 ## API Endpoints & Actions Mapping
 
 | Mobile Store Action | API Route | HTTP Method | Server Behavior |
 | --- | --- | --- | --- |
-| `addTransaction` | `/transactions` | `POST` | Applies ledger rules in `backend/src/domain/ledger.js`. Updates account balance/spend, friend balances for equal/exact/percentage/shares splits, and trip spends. |
-| `settleWithFriend` | `/transactions` | `POST` | Creates settlement transaction record, updates payer/receiver account balance and resets friend net balance to 0. |
-| `importTransactions` (multi-app import) | `/transactions/batch` | `POST` | Processes batch array of imported JSON/XLSX transactions and atomically persists up to 25 items per DynamoDB chunk with retry backoff. |
-| `deleteTransaction` | `/transactions/{transactionId}` | `DELETE` | Removes transaction from DynamoDB. |
-| `addFriend`, `updateFriend` | `/entities/friends/{id}` | `PUT` | Persists friend record in DynamoDB. |
-| `deleteFriend` | `/entities/friends/{id}` | `DELETE` | Removes friend record from DynamoDB. |
-| `addTrip`, `addMemberToTrip` | `/entities/trips/{id}` | `PUT` | Persists trip record in DynamoDB. |
-| `deleteTrip` | `/entities/trips/{id}` | `DELETE` | Removes trip record from DynamoDB. |
-| `addUpiAccount` | `/entities/accounts/{id}` | `PUT` | Persists UPI / card account record in DynamoDB. |
-| `deleteUpiAccount` | `/entities/accounts/{id}` | `DELETE` | Removes account record from DynamoDB. |
-| `addCategory`, `updateCategory` | `/entities/categories/{id}` | `PUT` | Persists custom category in DynamoDB. |
-| `deleteCategory` | `/entities/categories/{id}` | `DELETE` | Removes category record from DynamoDB. |
-| State Hydration | `/state` | `GET` | Paginated DynamoDB query returning `{ accounts, friends, trips, categories, transactions }`. |
-| Full Cloud Sync | `/state` | `PUT` / `POST` | Batch synchronizes complete local state to DynamoDB. |
-| `eraseAllData` (Fresh Start) | `/state/erase` | `POST` / `DELETE` | Batch deletes all stored entities and transactions for the user. |
-| Service Health | `/health` | `GET` | Health check endpoint returning status and API version. |
-| View Changelog | `/changelog` | `GET` | Returns list of published release notes. |
-| Admin Publish Changelog | `/admin/changelog` | `POST` | Publishes new release notes (protected by `x-admin-key`). |
+| Signup/signin/password reset | Firebase Authentication SDK | SDK | AWS never receives the password. |
+| Profile/bootstrap/onboarding | `/api/profile`, `/auth/me` | GET; profile PUT | Registered profile and atomic username claim. |
+| Username availability | `/api/users/username?value=handle` | GET | `{ available }`. |
+| Real member search | `/api/users/search?q=name-or-@handle` | GET | Public profiles; names can repeat, usernames are unique. |
+| Avatar/cover upload | `/api/media` | POST | `{ reference, url }`; JPEG/PNG/WebP, maximum 3 MB, deterministic content key. |
+| `addTransaction` | `/transactions` | POST | Atomic expense/income/transfer and server-calculated balances/analytics. |
+| `settleWithFriend` | `/api/settlements` | POST | `{ friendId, amount?, accountId? }`; supports partial/full payments. |
+| `importTransactions` | `/transactions/batch` | POST | 1–50 entries; individual transactions and stable per-entry retry keys. |
+| Individual transaction | `/transactions/{id}` | GET/DELETE | Caller-visible history; creator-only financial reversal. |
+| Paginated history | `/transactions?limit=50&cursor=...` | GET | `{ items, cursor }`, scoped to caller/current generation. |
+| Link/edit/remove member | `/entities/friends/{uid}` | PUT/DELETE | Registered members; deletion requires settled debts and no shared trip. |
+| Create/edit/archive trip | `/entities/trips/{id}` | PUT/DELETE | Creator-controlled canonical trip and member projections. |
+| Add/remove trip member | `/api/trips/{id}/members/{uid}` | PUT/DELETE | Creator-controlled membership; debts/history remain. |
+| Trip history | `/api/trips/{id}/transactions?cursor=...` | GET | Canonical history and historical public profiles; current members only. |
+| Payment profiles | `/entities/accounts/{id}` | PUT/DELETE | Create/update/archive; balances are server calculated; last four card digits only. |
+| Categories | `/entities/categories/{id}` | PUT/DELETE | User category configuration. |
+| Preferences | `/api/settings` | PUT | Selected/receiving profile, theme/privacy/glass; INR ledger. |
+| Analytics | `/api/analytics?period=Month&year=2026&month=11` | GET | Real categories/totals/points; also Year and Date with `date=YYYY-MM-DD`. |
+| Templates | `/templates`, `/templates/{id}` | GET/POST/PUT/DELETE | User-owned templates; `/api/templates` aliases also supported. |
+| Recurring rules | `/recurring`, `/recurring/due`, `/recurring/{id}` | GET/POST/PUT/DELETE | Rules filtered to the current generation. |
+| Process/skip recurring | `/recurring/{id}/process`, `/recurring/{id}/skip` | POST | Server-validated due-date advance; processing uses an occurrence key. |
+| State hydration | `/state` | GET | Schema-version-2 cloud snapshot. |
+| Fresh ledger | `/state/erase`, or DELETE `/state` | POST/DELETE | New generation; hides prior history and retains existing AWS records. |
+| Health/changelog | `/health`, `/changelog` | GET | Public information. |
+| Admin publication | `/admin/changelog` | POST | Existing `x-admin-key`; never expose it in a mobile build. |
 
-## Architecture & Cost Optimization ($200 Credit Efficiency)
+## Authentication, responses and storage
 
-1. **Amazon API Gateway HTTP API (v2)**:
-   - 70% cheaper than REST API ($1.00 per million requests).
-   - Built-in CORS and sub-millisecond overhead.
-2. **AWS Lambda (arm64 Graviton2)**:
-   - 20% lower cost per ms with faster cold-starts on Node.js 22.x.
-   - 256MB memory allocation.
-   - Perpetual AWS Free Tier: 1,000,000 invocations and 3.2M seconds free each month.
-3. **Amazon DynamoDB (Pay-Per-Request)**:
-   - $0.00 idle cost (no provisioned read/write capacity charges).
-   - Free Tier perpetual allowance: 25GB storage, 25 RCU/WCU.
-4. **AWS Systems Manager (SSM) Parameter Store**:
-   - Standard tier parameters for API keys (`/splittrack/api-key` and `/splittrack/admin-api-key`) with zero maintenance cost.
-5. **Idle Monthly Cost**: **$0.00**. $200 credits will easily last for years under typical production usage.
+All protected routes require `Authorization: Bearer <Firebase ID token>`. Mutations require a unique `idempotency-key` and the exact same payload on retries; server markers last seven days. Firebase web settings are public app configuration. Never include service-account private keys, AWS credentials, admin keys or refresh tokens in `EXPO_PUBLIC_*`. Both mobile workflows receive the public build configuration through GitHub variables. Shared API keys and fixed user IDs no longer authenticate mobile requests.
+
+Mutation responses normally contain `{ result, state }`. Snapshots include `schemaVersion: 2`, `userId`, `revision`, `profile`, `accounts`, `friends`, `trips`, `categories`, `transactions`, `transactionCursor`, `settings`, and all-time/category/month `summary` aggregates. API amounts are rupees; calculations/storage use integer paise. `user` aliases the authenticated caller; other IDs must identify registered members. Caller-controlled `x-user-id` is ignored.
+
+A ₹70.30 expense split equally between two people produces a ₹35.15 debt. Paying ₹30.15 leaves ₹5 and keeps the expense unsettled. Deletions reverse financial effects rather than losing the payment history. Complete-state PUT/POST is rejected with `405`; legacy `/auth/signup`, `/auth/signin`, `/auth/google` routes are retired in favor of Firebase.
+
+Errors return `{ message, code }` with their HTTP status. Clients refresh tokens after 401 and retry transient failures using the original key. Active forms retain their submitted draft/key while retrying. There is no offline financial outbox or draft recovery across app relaunches; inspect history before manually reentering an uncertain save after relaunching. Failed imports can be partially saved; retry the original batch key or review the ledger.
+
+Existing table usage: `SplitTrackData` holds profiles, username/search rows and transaction lookups; `SplitTrackLedgerData` holds user state, canonical trips, outstanding pair claims, journals, analytics and request markers; `SplitTrackTransactions` holds user/trip projections with generation prefixes and reversal tombstones. The existing recurring/template/changelog tables retain their respective features. Queries and batch reads avoid scanning financial history for snapshots. Conditional revisions and DynamoDB transactions protect balances/projections together. Only request markers have `expiresAt` for TTL; existing historical records are retained.
