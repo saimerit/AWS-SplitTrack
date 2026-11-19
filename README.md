@@ -29,7 +29,9 @@ Trip creators manage membership. Removed members lose trip access and retain the
 
 Payment profiles are manually entered ledger profiles, not bank integrations. A UPI QR contains the receiving UPI ID and amount. Users confirm payment in their UPI app; marking it paid records that confirmation and does not independently verify bank settlement.
 
-`POST /state/erase` starts a new private ledger generation after shared balances are settled and trips archived. It hides earlier history and disables prior-generation recurring rules, while retaining the registered profile and existing AWS records. It is not physical historical-record deletion.
+`POST /state/erase` starts a fresh ledger even with unpaid balances or active trips. It clears the caller's payment profiles and relationships, cancels pair claims, removes owned trips (including archived records and their trip history), and leaves joined trips for the other members. Paginated cleanup physically deletes the caller's transaction projections, lookups, private journals, analytics, recurring rules and templates. Shared journals retain the other participants' financial history and detach the reset user's effects, so later deletion cannot recreate an old debt. Sign-in, profile and app preferences stay.
+
+Cleanup commits in bounded transactions and returns `result.needsContinue` when another request is needed. Reuse the same idempotency key; the snapshot's `ledgerResetId` lets the app resume after interruption. Normal financial writes reject with `LEDGER_RESETTING` during cleanup. `GET /state?after=<revision>` returns a small unchanged response when possible, allowing fast foreground reconciliation on the existing HTTP API. No additional AWS services are required.
 
 ## Validate and deploy
 

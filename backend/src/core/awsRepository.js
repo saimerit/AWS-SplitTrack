@@ -104,7 +104,7 @@ export class AwsRepository {
         TransactItems: actions.map((action) => {
           const table = this.tables[action.table];
           if (action.type === "delete")
-            return { Delete: { TableName: table, Key: action.key } };
+            return { Delete: { TableName: table, Key: action.key, ...(action.revision !== undefined ? { ConditionExpression: "#rev = :rev", ExpressionAttributeNames: { "#rev": "revision" }, ExpressionAttributeValues: { ":rev": action.revision } } : {}) } };
           const condition = action.unique
             ? "attribute_not_exists(#pk) OR #owner = :owner"
             : action.revision !== undefined
@@ -134,6 +134,19 @@ export class AwsRepository {
         }),
       }),
     );
+  }
+  async ownedTrips(uid, { cursor, limit = 80 } = {}) {
+    // Reset-only discovery includes archived trips no longer in the active state.
+    // This uses the existing ledger table and never scans transaction contents.
+    const result = await this.client.send(new ScanCommand({
+      TableName: this.tables.ledger,
+      FilterExpression: "begins_with(#pk, :trip) AND #owner = :uid",
+      ProjectionExpression: "#pk, #sk, #id",
+      ExpressionAttributeNames: { "#pk": "ledgerId", "#sk": "recordId", "#id": "id", "#owner": "ownerId" },
+      ExpressionAttributeValues: { ":trip": "TRIP#", ":uid": uid },
+      ExclusiveStartKey: cursor, Limit: limit, ConsistentRead: true,
+    }));
+    return { items: result.Items || [], cursor: result.LastEvaluatedKey };
   }
   async releases() {
     const result = await this.client.send(

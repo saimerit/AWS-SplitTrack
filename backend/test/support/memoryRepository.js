@@ -60,8 +60,13 @@ export class MemoryRepository {
       throw new Error("Injected database failure");
     }
     for (const action of actions) {
-      if (action.type === "delete") continue;
-      const old = this.rows.get(this.key(action.table, action.item));
+      const old = this.rows.get(this.key(action.table, action.item || action.key));
+      if (action.type === "delete") {
+        if (action.revision === undefined || old?.revision === action.revision) continue;
+        const error = new Error("Conditional delete conflict");
+        error.name = "TransactionCanceledException";
+        throw error;
+      }
       if (
         (action.unique && old && old.uid !== action.item.uid) ||
         (action.revision !== undefined &&
@@ -84,5 +89,15 @@ export class MemoryRepository {
   }
   async releases() {
     return [];
+  }
+  async ownedTrips(uid, { cursor, limit = 80 } = {}) {
+    const orderedKey = row => `${row.ledgerId}\u0000${row.recordId}`;
+    const rows = [...this.rows.entries()].filter(([key]) => key.startsWith("ledger:")).map(([, row]) => row).sort((a, b) => orderedKey(a).localeCompare(orderedKey(b)));
+    const remaining = cursor ? rows.filter(row => orderedKey(row).localeCompare(orderedKey(cursor)) > 0) : rows;
+    const scanned = remaining.slice(0, limit);
+    return {
+      items: scanned.filter(row => row.ledgerId.startsWith("TRIP#") && row.ownerId === uid).map(row => structuredClone(row)),
+      cursor: remaining.length > limit && scanned.length ? { ledgerId: scanned.at(-1).ledgerId, recordId: scanned.at(-1).recordId } : undefined,
+    };
   }
 }

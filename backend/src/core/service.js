@@ -83,8 +83,9 @@ const imageRef = (value, uid) => {
 };
 
 class Work {
-  constructor(repo) {
+  constructor(repo, allowReset = false) {
     this.repo = repo;
+    this.allowReset = allowReset;
     this.cache = new Map();
     this.states = new Map();
     this.changedStates = new Set();
@@ -138,17 +139,19 @@ class Work {
       ...options,
     });
   }
-  delete(table, key) {
+  delete(table, key, options = {}) {
     this.actions.set(`${table}:${keyOf(table, key)}`, {
       type: "delete",
       table,
       key,
+      ...options,
     });
   }
   async commit() {
     for (const uid of this.changedStates) {
       const state = this.states.get(uid),
         revision = state.revision;
+      ensure(this.allowReset || !state.resetting, "A fresh ledger is being prepared. Please try again shortly.", 409, "LEDGER_RESETTING");
       state.revision++;
       state.updatedAt = new Date().toISOString();
       ensure(
@@ -256,7 +259,7 @@ export class SplitTrackService {
           { revision: 0 },
         );
         await work.commit();
-        return { result, state: await this.snapshot(auth.uid) };
+        return { result, state: await this.snapshot(auth.uid, work.states.get(auth.uid)) };
       } catch (error) {
         if (!this.isConflict(error)) throw error;
         if (attempt === 4)
@@ -429,7 +432,7 @@ export class SplitTrackService {
         : activeAccount(state, state.settings.receivingAccountId) ||
           usableAccounts(state).find((account) => account.kind === "upi");
     state.settings.receivingAccountId = account?.id || "";
-    if (profile) work.put("data", { ...profile, upiId: account?.upiId || "" });
+    if (profile) work.put("data", { ...profile, upiId: account?.upiId || "", paymentName: account?.title || "" });
   }
   async saveEntity(auth, requestId, type, id, body) {
     return this.mutation(
@@ -665,6 +668,10 @@ export class SplitTrackService {
         if (body.themeMode !== undefined) {
           ensure(["dark", "light"].includes(body.themeMode), "Invalid theme.");
           state.settings.themeMode = body.themeMode;
+        }
+        if (body.selectionStyle !== undefined) {
+          ensure(["chips", "dropdown"].includes(body.selectionStyle), "Invalid selection style.");
+          state.settings.selectionStyle = body.selectionStyle;
         }
         for (const field of ["hideAmounts", "isLiquidGlassEnabled"])
           if (body[field] !== undefined) {
@@ -1440,37 +1447,152 @@ export class SplitTrackService {
     };
   }
   async erase(auth, requestId) {
-    const state =
-      (await this.repo.get("ledger", ledgerKey(auth.uid))) ||
-      emptyState(auth.uid);
-    ensure(
-      state.friends.every((friend) => friend.netCents === 0) &&
-        state.trips.length === 0,
-      "Settle outstanding balances and leave or archive your trips before erasing data.",
-      409,
-    );
-    return this.mutation(
-      auth,
-      requestId,
-      { operation: "erase" },
-      async (work) => {
-        const latest = await work.state(auth.uid);
-        ensure(
-          latest.friends.every((friend) => friend.netCents === 0) &&
-            latest.trips.length === 0,
-          "Your shared balances changed. Settle them before erasing data.",
-          409,
-        );
+    ensure(typeof requestId === "string" && /^[A-Za-z0-9_-]{12,100}$/.test(requestId), "A valid idempotency-key is required.");
+    await this.bootstrap(auth);
+    const hash = jsonHash({ operation: "erase" });
+    const markerKey = ledgerKey(auth.uid, `REQUEST#${requestId}`);
+    const marker = await this.repo.get("ledger", markerKey);
+    if (marker) {
+      ensure(marker.hash === hash, "This request ID was already used for another operation.", 409, "IDEMPOTENCY_CONFLICT");
+      if (marker.result.erased || !marker.resetId) return { result: marker.result, state: await this.snapshot(auth.uid) };
+      const current = await this.repo.get("ledger", ledgerKey(auth.uid));
+      if (current?.resetting?.id !== marker.resetId) return { result: { erased: true, needsContinue: false }, state: await this.snapshot(auth.uid, current) };
+    }
+    // Commit the new generation first. Every normal write checks resetting in
+    // Work.commit, preventing an in-flight shared expense from restoring data.
+    // Each cleanup step is small, transactional and resumable after a timeout.
+    const step = async (callback) => {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const work = new Work(this.repo, true);
+        const state = await work.state(auth.uid);
+        const result = await callback(work, state);
+        try { await work.commit(); return result; }
+        catch (error) {
+          if (!this.isConflict(error)) throw error;
+          if (attempt === 4) throw new ApiError(409, "Another device updated this ledger. Please retry.", "WRITE_CONFLICT");
+          await new Promise(resolve => setTimeout(resolve, 20 * 2 ** attempt));
+        }
+      }
+    };
+    await step(async (work, current) => {
+      if (await work.get("ledger", markerKey)) return;
+      if (!current.resetting) {
         const cleared = emptyState(auth.uid);
-        cleared.revision = latest.revision;
-        cleared.generation = (latest.generation || 0) + 1;
-        // Generation hides prior private history immediately; existing AWS records and other users remain untouched.
+        cleared.revision = current.revision;
+        cleared.generation = (current.generation || 0) + 1;
+        cleared.settings = { ...current.settings, selectedAccountId: "", receivingAccountId: "" };
+        cleared.resetting = { id: requestId, peers: current.friends.map(friend => friend.id), trips: current.trips.map(trip => trip.id), stage: 0 };
         work.states.set(auth.uid, cleared);
         work.stateChanged(auth.uid);
         await this.publishReceiving(work, auth.uid);
-        return { erased: true };
-      },
-    );
+      }
+      // Joining an in-progress reset also gets a durable marker. Replaying any
+      // joined request after completion must never erase the next ledger.
+      work.put("ledger", {
+        ...markerKey, revision: 1, hash,
+        resetId: work.states.get(auth.uid).resetting.id,
+        result: { erased: false, needsContinue: true },
+        expiresAt: Math.floor(Date.now() / 1000) + 7 * 86400,
+      }, { revision: 0 });
+    });
+    const deadline = Date.now() + 7000;
+    let finished = false;
+    do {
+      finished = await step(async (work, state) => {
+        const reset = state.resetting;
+        if (!reset) return true;
+        if (reset.purgingTrip) {
+          const id = reset.purgingTrip;
+          const page = await this.repo.query("transactions", "ledgerId", `TRIP#${id}`, { limit: 20 });
+          for (const row of page.items) {
+            const journal = row.id ? await work.get("ledger", ledgerKey(`JOURNAL#${row.id}`)) : null;
+            if (journal?.tripId === id) {
+              delete journal.tripId;
+              journal.tripSpendCents = 0;
+              work.rowChanged(journal);
+            }
+            work.delete("transactions", { ledgerId: `TRIP#${id}`, transactionId: row.transactionId });
+          }
+          if (!page.items.length) {
+            const trip = await work.get("ledger", ledgerKey(`TRIP#${id}`));
+            if (trip) work.delete("ledger", ledgerKey(`TRIP#${id}`), { revision: trip.revision });
+            delete reset.purgingTrip;
+          }
+        } else if (reset.peers.length) {
+          const peerId = reset.peers[0];
+          const peer = await work.state(peerId);
+          const relationship = peer.friends.find(friend => friend.id === auth.uid);
+          if (relationship && relationship.netCents !== 0) {
+            relationship.netCents = 0;
+            work.stateChanged(peerId);
+          }
+          const pair = await work.get("ledger", ledgerKey(pairId(auth.uid, peerId)));
+          if (pair) { pair.claims = []; work.rowChanged(pair); }
+          reset.peers.shift();
+        } else if (reset.trips.length) {
+          const id = reset.trips[0];
+          const trip = await work.get("ledger", ledgerKey(`TRIP#${id}`));
+          if (trip) {
+            const previousMembers = [...trip.members];
+            if (trip.ownerId === auth.uid) { trip.deleted = true; reset.purgingTrip = id; }
+            trip.members = trip.members.filter(member => member !== auth.uid);
+            for (const member of previousMembers) {
+              if (member === auth.uid) continue;
+              const peer = await work.state(member);
+              peer.trips = peer.trips.filter(item => item.id !== id);
+              if (!trip.deleted && trip.members.includes(member)) peer.trips.push(structuredClone(trip));
+              work.stateChanged(member);
+            }
+            work.rowChanged(trip);
+          }
+          reset.trips.shift();
+        } else if (reset.stage === 0) {
+          const page = await this.repo.ownedTrips(auth.uid, { cursor: reset.tripCursor });
+          reset.trips = page.items.map(trip => trip.id || trip.ledgerId.slice(5));
+          if (page.cursor) reset.tripCursor = page.cursor;
+          else { delete reset.tripCursor; reset.stage++; }
+        } else if (reset.stage === 1) {
+          const page = await this.repo.query("transactions", "ledgerId", auth.uid, { prefix: "TX#", limit: 20 });
+          for (const row of page.items) {
+            const id = row.id || row.data?.id;
+            const journal = id ? await work.get("ledger", ledgerKey(`JOURNAL#${id}`)) : null;
+            if (journal) {
+              journal.participantIds = journal.participantIds.filter(uid => uid !== auth.uid);
+              delete journal.effects[auth.uid];
+              delete journal.sortKeys[auth.uid];
+              journal.flows = journal.flows.filter(flow => flow.creditor !== auth.uid && flow.debtor !== auth.uid);
+              if (journal.participantIds.length) work.rowChanged(journal);
+              else work.delete("ledger", ledgerKey(`JOURNAL#${id}`), { revision: journal.revision });
+            }
+            work.delete("transactions", { ledgerId: auth.uid, transactionId: row.transactionId });
+            if (id) work.delete("data", { userId: auth.uid, recordId: `TX#${id}` });
+          }
+          if (!page.items.length) reset.stage++;
+        } else if (reset.stage <= 6) {
+          const table = ["ledger", "ledger", "data", "recurring", "templates"][reset.stage - 2];
+          const partition = table === "data" ? "userId" : "ledgerId";
+          const value = reset.stage === 2 ? `ANALYTICS#${auth.uid}` : auth.uid;
+          const page = await this.repo.query(table, partition, value, { ...(table === "ledger" ? { prefix: "DAY#" } : table === "data" ? { prefix: "TX#" } : {}), limit: 80 });
+          for (const row of page.items) {
+            const sortKey = { ledger: "recordId", data: "recordId", recurring: "recurringId", templates: "templateId" }[table];
+            work.delete(table, { [partition]: value, [sortKey]: row[sortKey] });
+          }
+          if (!page.items.length) reset.stage++;
+        } else {
+          delete state.resetting;
+          const result = { erased: true, needsContinue: false };
+          const expiresAt = Math.floor(Date.now() / 1000) + 7 * 86400;
+          for (const id of new Set([requestId, reset.id])) {
+            work.put("ledger", { ...ledgerKey(auth.uid, `REQUEST#${id}`), revision: 1, hash, result, expiresAt });
+          }
+          work.stateChanged(auth.uid);
+          return true;
+        }
+        work.stateChanged(auth.uid);
+        return false;
+      });
+    } while (!finished && Date.now() < deadline);
+    return { result: { erased: finished, needsContinue: !finished }, state: await this.snapshot(auth.uid) };
   }
   nextDue(value, frequency) {
     const date = new Date(value);
@@ -1587,7 +1709,7 @@ export class SplitTrackService {
       },
     );
   }
-  async history(uid, { cursor, limit = 50, tripId } = {}) {
+  async history(uid, { cursor, limit = 50, tripId, generation: knownGeneration } = {}) {
     let decoded;
     if (cursor) {
       try {
@@ -1602,20 +1724,22 @@ export class SplitTrackService {
     }
     const generation = tripId
       ? undefined
-      : (await this.repo.get("ledger", ledgerKey(uid)))?.generation || 0;
-    const page = await this.repo.query(
-      "transactions",
-      "ledgerId",
-      tripId ? `TRIP#${tripId}` : uid,
-      {
+      : knownGeneration ?? (await this.repo.get("ledger", ledgerKey(uid)))?.generation ?? 0;
+    const wanted = Math.min(Math.max(Number(limit) || 50, 1), 100);
+    const rows = [];
+    let nextCursor = decoded;
+    // Deleted projections must not turn a nonempty ledger into an empty page.
+    // Keep the native DynamoDB cursor while filling the requested visible page.
+    for (let scan = 0; scan < 20; scan++) {
+      const page = await this.repo.query("transactions", "ledgerId", tripId ? `TRIP#${tripId}` : uid, {
         prefix: tripId ? "TX#" : `TX#${String(generation).padStart(6, "0")}#`,
-        cursor: decoded,
-        limit: Math.min(Math.max(Number(limit) || 50, 1), 100),
-        reverse: true,
-      },
-    );
-    const rows = page.items.filter((row) => !row.deleted),
-      pairIds = [...new Set(rows.flatMap((row) => row.pairIds || []))];
+        cursor: nextCursor, limit: wanted - rows.length, reverse: true,
+      });
+      rows.push(...page.items.filter(row => !row.deleted));
+      nextCursor = page.cursor;
+      if (rows.length >= wanted || !nextCursor) break;
+    }
+    const pairIds = [...new Set(rows.flatMap((row) => row.pairIds || []))];
     const pairs = await this.repo.many(
       "ledger",
       pairIds.map((id) => ledgerKey(id)),
@@ -1639,23 +1763,29 @@ export class SplitTrackService {
     }));
     return {
       items,
-      cursor: page.cursor
-        ? Buffer.from(JSON.stringify(page.cursor)).toString("base64url")
+      cursor: nextCursor
+        ? Buffer.from(JSON.stringify(nextCursor)).toString("base64url")
         : null,
     };
   }
-  async snapshot(uid) {
-    const [stored, profile, page] = await Promise.all([
-      this.repo.get("ledger", ledgerKey(uid)),
+  async sync(uid, after) {
+    const state = (await this.repo.get("ledger", ledgerKey(uid))) || emptyState(uid);
+    if (/^\d+$/.test(String(after ?? "")) && Number(after) === state.revision && !state.resetting) {
+      return { changed: false, revision: state.revision };
+    }
+    return { changed: true, state: await this.snapshot(uid, state) };
+  }
+  async snapshot(uid, stored) {
+    const state = stored || (await this.repo.get("ledger", ledgerKey(uid))) || emptyState(uid);
+    const [profile, page, profiles] = await Promise.all([
       this.repo.get("data", profileKey(uid)),
-      this.history(uid),
-    ]);
-    const state = stored || emptyState(uid),
-      profiles = await this.repo.many(
+      this.history(uid, { generation: state.generation || 0 }),
+      this.repo.many(
         "data",
         state.friends.map((friend) => profileKey(friend.id)),
       ),
-      byId = new Map(profiles.map((profile) => [profile.uid, profile]));
+    ]);
+    const byId = new Map(profiles.map((profile) => [profile.uid, profile]));
     const friends = await Promise.all(
       state.friends.map(async (friend) => {
         const profile = byId.get(friend.id);
@@ -1667,6 +1797,7 @@ export class SplitTrackService {
             friend.avatarRef || profile?.avatarRef || "",
           ),
           upiId: profile?.upiId || undefined,
+          paymentName: profile?.paymentName || profile?.name || undefined,
           phone: friend.phone || undefined,
           netBalance: amount(friend.netCents),
         };
@@ -1702,6 +1833,8 @@ export class SplitTrackService {
       schemaVersion: 2,
       userId: uid,
       revision: state.revision,
+      generation: state.generation || 0,
+      ledgerResetId: state.resetting?.id || null,
       accounts,
       friends,
       trips,

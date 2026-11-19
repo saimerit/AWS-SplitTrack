@@ -141,6 +141,7 @@ export function createHandler(
       if (path === "/api/analytics" && method === "GET")
         return response(await app.analytics(auth, query));
       if (path === "/state" && method === "GET") {
+        if (query.after !== undefined) return response(await app.sync(auth.uid, query.after));
         await app.bootstrap(auth);
         return response(await app.snapshot(auth.uid));
       }

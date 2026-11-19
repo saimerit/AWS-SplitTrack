@@ -245,7 +245,7 @@ test("default receiving UPI stays private and survives selecting a bank card", a
     /last four/,
   );
 });
-test("fresh start hides old private history and keeps another user financial data unchanged", async () => {
+test("fresh start deletes private history and keeps unrelated financial data unchanged", async () => {
   const { app, repo } = await setup();
   const tx = await app.transaction(alice, request(), {
     title: "Income",
@@ -271,6 +271,164 @@ test("fresh start hides old private history and keeps another user financial dat
     before,
   );
   assert.equal((await app.snapshot(bob.uid)).friends[0].upiId, undefined);
+  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 0);
+  assert.equal(await repo.get("data", { userId: alice.uid, recordId: `TX#${tx.result.id}` }), undefined);
+  assert.equal(await repo.get("ledger", { ledgerId: `JOURNAL#${tx.result.id}`, recordId: "STATE" }), undefined);
+});
+
+test("fresh ledger removes unsettled splits and trips without blocking or replaying", async () => {
+  const { repo, app } = await setup();
+  await app.settings(alice, request(), { selectionStyle: "dropdown", themeMode: "light" });
+  await app.saveEntity(alice, request(), "trips", "fresh-trip", { name: "Test trip", startDate: "2026-11-18", members: ["user", bob.uid], coverGradient: ["#123456", "#654321"] });
+  const tx = await app.transaction(alice, request(), { ...expense, tripId: "fresh-trip" });
+  await app.settle(bob, request(), { friendId: alice.uid, amount: 10 });
+  await app.saveEntity(alice, request(), "templates", "old-template", { name: "Saved expense", amount: 10, transactionType: "expense" });
+  const id = request();
+  const reset = await app.erase(alice, id);
+  assert.equal(reset.result.erased, true);
+  assert.equal(reset.result.needsContinue, false);
+  assert.deepEqual(reset.state.transactions, []);
+  assert.deepEqual(reset.state.friends, []);
+  assert.deepEqual(reset.state.trips, []);
+  assert.equal(reset.state.settings.selectionStyle, "dropdown");
+  assert.equal(reset.state.settings.themeMode, "light");
+  assert.equal((await app.snapshot(bob.uid)).friends[0].netBalance, 0);
+  assert.deepEqual((await app.snapshot(bob.uid)).trips, []);
+  assert.deepEqual((await repo.get("ledger", { ledgerId: pairId(alice.uid, bob.uid), recordId: "STATE" })).claims, []);
+  assert.equal((await app.records(alice, "templates")).items.length, 0);
+  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 0);
+  assert.equal((await repo.query("ledger", "ledgerId", alice.uid, { prefix: "DAY#" })).items.length, 0);
+  assert.equal((await repo.get("ledger", { ledgerId: `JOURNAL#${tx.result.id}`, recordId: "STATE" })).participantIds.includes(alice.uid), false);
+  const repeated = await app.erase(alice, id);
+  assert.equal(repeated.state.generation, reset.state.generation);
+  assert.deepEqual(repeated.result, reset.result);
+  const next = await app.saveEntity(alice, request(), "accounts", "new-upi", { title: "Fresh UPI", kind: "upi", upiId: "new@okaxis" });
+  assert.equal(next.state.accounts.length, 1);
+});
+
+test("interrupted ledger cleanup resumes and rejects concurrent shared writes", async () => {
+  const { repo, app } = await setup();
+  await app.transaction(alice, request(), expense);
+  const transact = repo.transact.bind(repo);
+  let commits = 0;
+  repo.transact = async actions => { if (++commits === 2) throw new Error("Connection interrupted"); return transact(actions); };
+  const id = request();
+  await assert.rejects(app.erase(alice, id), /Connection interrupted/);
+  assert.ok((await repo.get("ledger", { ledgerId: alice.uid, recordId: "STATE" })).resetting);
+  await assert.rejects(app.transaction(bob, request(), { ...expense, splits: [{ friendId: "user", paidAmount: 70.3 }, { friendId: alice.uid, paidAmount: 0 }] }), error => error.code === "LEDGER_RESETTING");
+  repo.transact = transact;
+  const resumed = await app.erase(alice, id);
+  assert.equal(resumed.result.erased, true);
+  assert.equal(resumed.state.generation, 1);
+  assert.equal(balance(await app.snapshot(bob.uid), alice.uid), 0);
+});
+
+test("sync skips unchanged snapshots and includes both sides of a new split", async () => {
+  const { app, repo } = await setup();
+  const before = await app.snapshot(bob.uid);
+  const reads = repo.queryReads;
+  assert.deepEqual(await app.sync(bob.uid, before.revision), { changed: false, revision: before.revision });
+  assert.equal(repo.queryReads, reads);
+  await app.transaction(alice, request(), expense);
+  const changed = await app.sync(bob.uid, before.revision);
+  assert.equal(changed.changed, true);
+  assert.equal(changed.state.transactions.length, 1);
+  assert.equal(changed.state.friends[0].upiId, "alex_lee@okaxis");
+  assert.equal(changed.state.friends[0].paymentName, "Test UPI");
+  await assert.rejects(app.settings(alice, request(), { selectionStyle: "other" }), /selection style/);
+});
+
+test("fresh ledger physically deletes paginated analytics, private journals and archived trip records", async () => {
+  const { repo, app } = await setup();
+  const ids = [];
+  for (let index = 0; index < 125; index++) {
+    const date = new Date(Date.UTC(2026, 0, index + 1)).toISOString().slice(0, 10);
+    const result = await app.transaction(alice, request(), { title: `Private entry ${index}`, type: "income", amount: 1, date });
+    ids.push(result.result.id);
+  }
+  await app.saveEntity(alice, request(), "trips", "archived-reset-trip", { name: "Old trip", members: ["user", bob.uid] });
+  const shared = await app.transaction(bob, request(), { ...expense, tripId: "archived-reset-trip", splits: [{ friendId: "user", paidAmount: 70.3 }, { friendId: alice.uid, paidAmount: 0 }] });
+  await app.deleteEntity(alice, request(), "trips", "archived-reset-trip");
+  assert.equal((await app.snapshot(alice.uid)).trips.length, 0);
+  await app.erase(alice, request());
+  for (const id of ids) assert.equal(await repo.get("ledger", { ledgerId: `JOURNAL#${id}`, recordId: "STATE" }), undefined);
+  assert.equal((await repo.query("ledger", "ledgerId", `ANALYTICS#${alice.uid}`, { prefix: "DAY#" })).items.length, 0);
+  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 0);
+  assert.equal((await repo.query("data", "userId", alice.uid, { prefix: "TX#" })).items.length, 0);
+  assert.equal(await repo.get("ledger", { ledgerId: "TRIP#archived-reset-trip", recordId: "STATE" }), undefined);
+  assert.equal((await repo.query("transactions", "ledgerId", "TRIP#archived-reset-trip")).items.length, 0);
+  // The peer can still remove their shared entry after its old trip was purged.
+  await app.deleteTransaction(bob, request(), shared.result.id);
+  assert.equal((await app.snapshot(bob.uid)).summary.totalExpenses, 0);
+  assert.equal(balance(await app.snapshot(bob.uid), alice.uid), 0);
+});
+
+test("resetting a joined trip preserves other members and old reversals cannot revive erased debts", async () => {
+  const { app, repo } = await setup();
+  const charlie = { uid: "charlieTestUid", email: "charlie@example.invalid", name: "Charlie" };
+  await app.bootstrap(charlie);
+  await app.updateProfile(charlie, request(), { username: "charlie_test", displayName: charlie.name });
+  await app.saveEntity(bob, request(), "trips", "joined-reset-trip", { name: "Peer trip", members: ["user", alice.uid, charlie.uid] });
+  const shared = await app.transaction(bob, request(), { ...expense, tripId: "joined-reset-trip", splits: [{ friendId: "user", paidAmount: 70.3 }, { friendId: alice.uid, paidAmount: 0 }] });
+  await app.erase(alice, request());
+  const trip = await repo.get("ledger", { ledgerId: "TRIP#joined-reset-trip", recordId: "STATE" });
+  assert.deepEqual(trip.members.sort(), [bob.uid, charlie.uid].sort());
+  assert.equal((await app.snapshot(bob.uid)).trips.length, 1);
+  assert.equal((await app.snapshot(charlie.uid)).trips.length, 1);
+  await app.saveEntity(alice, request(), "accounts", "after-reset", { title: "New UPI", kind: "upi", upiId: "fresh@okaxis" });
+  await app.transaction(bob, request(), { ...expense, amount: -20, tripId: "joined-reset-trip", splits: [{ friendId: "user", paidAmount: 20 }, { friendId: charlie.uid, paidAmount: 0 }] });
+  await app.transaction(bob, request(), { ...expense, amount: -10, splits: [{ friendId: "user", paidAmount: 10 }, { friendId: alice.uid, paidAmount: 0 }] });
+  await app.deleteTransaction(bob, request(), shared.result.id);
+  assert.equal(balance(await app.snapshot(alice.uid), bob.uid), -5);
+  assert.equal(balance(await app.snapshot(bob.uid), alice.uid), 5);
+  assert.equal(balance(await app.snapshot(bob.uid), charlie.uid), 10);
+  assert.equal((await repo.get("ledger", { ledgerId: "TRIP#joined-reset-trip", recordId: "STATE" })).totalSpendCents, 2000);
+});
+
+test("overlapping and repeated fresh-ledger requests finish once per generation", async () => {
+  const { app } = await setup();
+  await app.transaction(alice, request(), expense);
+  const keys = [request(), request()];
+  const results = await Promise.all([app.erase(alice, keys[0]), app.erase(alice, keys[0]), app.erase(bob, keys[1])]);
+  assert.ok(results.every(result => result.result.erased));
+  assert.equal((await app.snapshot(alice.uid)).generation, 1);
+  assert.equal((await app.snapshot(bob.uid)).generation, 1);
+  assert.deepEqual((await app.snapshot(alice.uid)).transactions, []);
+  assert.deepEqual((await app.snapshot(bob.uid)).transactions, []);
+  assert.equal((await app.erase(alice, keys[0])).state.generation, 1);
+});
+
+test("a reset request joining another device stays idempotent after a new ledger starts", async () => {
+  const { app, repo } = await setup();
+  await app.transaction(alice, request(), expense);
+  const first = request(), joined = request();
+  const transact = repo.transact.bind(repo);
+  let commits = 0;
+  repo.transact = async actions => { if (++commits === 2) throw new Error("Interrupted reset"); return transact(actions); };
+  await assert.rejects(app.erase(alice, first), /Interrupted reset/);
+  commits = 0;
+  await assert.rejects(app.erase(alice, joined), /Interrupted reset/);
+  repo.transact = transact;
+  await app.erase(alice, first);
+  await app.transaction(alice, request(), { title: "Fresh income", amount: 10, type: "income" });
+  const repeated = await app.erase(alice, joined);
+  assert.equal(repeated.state.generation, 1);
+  assert.equal(repeated.state.summary.totalIncome, 10);
+  assert.equal(repeated.result.erased, true);
+  assert.equal(repeated.state.ledgerResetId, null);
+});
+
+test("history fills visible pages when deleted entries precede them", async () => {
+  const { app } = await setup();
+  const visible = await app.transaction(alice, request(), { title: "Visible income", amount: 10, type: "income", date: "2026-11-01" });
+  for (let index = 0; index < 3; index++) {
+    const deleted = await app.transaction(alice, request(), { title: "Deleted income", amount: 1, type: "income", date: "2026-11-18" });
+    await app.deleteTransaction(alice, request(), deleted.result.id);
+  }
+  const page = await app.history(alice.uid, { limit: 1 });
+  assert.equal(page.items.length, 1);
+  assert.equal(page.items[0].id, visible.result.id);
+  assert.equal(page.cursor, null);
 });
 test("recurring processing validates server state and commits the due date atomically", async () => {
   const { app } = await setup();

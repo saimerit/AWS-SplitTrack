@@ -45,6 +45,7 @@ export function emptyState(uid) {
       currency: "INR",
       hideAmounts: false,
       isLiquidGlassEnabled: true,
+      selectionStyle: "chips",
     },
     totals: { incomeCents: 0, expenseCents: 0, categories: {}, months: {} },
   };
