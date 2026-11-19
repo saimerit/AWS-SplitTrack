@@ -46,6 +46,7 @@ export function emptyState(uid) {
       hideAmounts: false,
       isLiquidGlassEnabled: true,
       selectionStyle: "chips",
+      notificationDirection: "bottom",
     },
     totals: { incomeCents: 0, expenseCents: 0, categories: {}, months: {} },
   };

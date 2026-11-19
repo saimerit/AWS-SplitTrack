@@ -675,6 +675,10 @@ export class SplitTrackService {
           ensure(["chips", "dropdown"].includes(body.selectionStyle), "Invalid selection style.");
           state.settings.selectionStyle = body.selectionStyle;
         }
+        if (body.notificationDirection !== undefined) {
+          ensure(["top", "bottom"].includes(body.notificationDirection), "Invalid notification direction.");
+          state.settings.notificationDirection = body.notificationDirection;
+        }
         for (const field of ["hideAmounts", "isLiquidGlassEnabled"])
           if (body[field] !== undefined) {
             ensure(typeof body[field] === "boolean", "Invalid preference.");
