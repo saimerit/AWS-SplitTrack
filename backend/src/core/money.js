@@ -173,22 +173,52 @@ export function applyPairFlow(pair, flow, transactionId) {
 export function reversePairFlow(pair, flow, transactionId) {
   let removed = 0;
   pair.claims = (pair.claims || []).filter((claim) => {
-    if (
-      claim.id === transactionId &&
-      claim.creditor === flow.creditor &&
-      claim.debtor === flow.debtor
-    ) {
-      removed += claim.remainingCents;
+    if (claim.id === transactionId) {
+      // A settlement may carry the remaining debt in the opposite direction
+      // from the payment itself. Remove that vector before reversing cash.
+      removed += claim.creditor === flow.creditor ? claim.remainingCents : -claim.remainingCents;
       return false;
     }
     return true;
   });
-  ensure(removed <= flow.cents, "Invalid expense reversal.", 409);
   const alreadyPaid = flow.cents - removed;
   if (alreadyPaid)
     applyPairFlow(
       pair,
-      { creditor: flow.debtor, debtor: flow.creditor, cents: alreadyPaid },
+      alreadyPaid > 0
+        ? { creditor: flow.debtor, debtor: flow.creditor, cents: alreadyPaid }
+        : { ...flow, cents: -alreadyPaid },
       `reversal#${transactionId}`,
     );
+}
+
+export function applySettlementFlow(pair, flow, transactionId, sourceId) {
+  if (sourceId) pair.claims = [...(pair.claims || []).filter(c => c.id === sourceId), ...(pair.claims || []).filter(c => c.id !== sourceId)];
+  const before = new Map((pair.claims || []).map(c => [c.id, c.remainingCents]));
+  applyPairFlow(pair, flow, transactionId);
+  // Bulk payments consolidate the pair. A transaction payment consolidates
+  // its source and any other claims actually reached by an overpayment.
+  pair.claims = pair.claims.map(claim => ({ ...claim, id: !sourceId || claim.id === sourceId || (before.has(claim.id) && before.get(claim.id) !== claim.remainingCents) ? transactionId : claim.id }));
+  const combined = new Map();
+  for (const claim of pair.claims) {
+    const key = `${claim.id}:${claim.creditor}:${claim.debtor}`;
+    const previous = combined.get(key);
+    if (previous) previous.remainingCents += claim.remainingCents;
+    else combined.set(key, { ...claim });
+  }
+  pair.claims = [...combined.values()];
+}
+
+export function settlementVector(data, pairs, viewer) {
+  const claims = pairs.flatMap(pair => pair.claims || []).filter(claim => claim.id === data.id);
+  const members = new Set([...(data.splits || []).map(split => split.friendId), ...claims.flatMap(claim => [claim.creditor, claim.debtor])]);
+  members.delete(data.type === 'settlement' ? data.creatorId : data.paidBy);
+  return [...members].map(member => {
+    const relevant = claims.filter(claim => claim.creditor === member || claim.debtor === member);
+    return {
+      memberId: alias(member, viewer),
+      remainingAmount: amount(relevant.reduce((sum, claim) => sum + claim.remainingCents, 0)),
+      balances: relevant.map(claim => ({ creditorId: alias(claim.creditor, viewer), debtorId: alias(claim.debtor, viewer), amount: amount(claim.remainingCents) })),
+    };
+  });
 }

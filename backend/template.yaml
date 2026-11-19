@@ -55,6 +55,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
       TableName: SplitTrackData
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
@@ -73,6 +76,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
       TableName: SplitTrackTransactions
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:

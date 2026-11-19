@@ -11,6 +11,8 @@ import {
   debtFlows,
   applyPairFlow,
   reversePairFlow,
+  applySettlementFlow,
+  settlementVector,
 } from "./money.js";
 
 const profileKey = (uid) => ({ userId: `USER#${uid}`, recordId: "PROFILE" });
@@ -893,13 +895,22 @@ export class SplitTrackService {
     work.rowChanged(row);
   }
   async transaction(auth, requestId, input, options = {}) {
-    const id = `tx-${crypto.randomUUID()}`,
+    const id = options.id || `tx-${crypto.randomUUID()}`,
       createdAt = new Date().toISOString();
     return this.mutation(
       auth,
       requestId,
-      { operation: "transaction", input },
+      { operation: options.replace ? "editTransaction" : "transaction", id: options.id, input: options.hashInput || input },
       async (work) => {
+        let previous;
+        if (options.replace) {
+          previous = await this.transactionJournal(work, auth, id);
+          ensure(!previous.deleted, "Restore this transaction before editing it.", 409);
+          await this.reverseTransaction(work, previous);
+          // The edit replaces projections in the same database transaction.
+          for (const uid of previous.participantIds) work.delete("transactions", { ledgerId: uid, transactionId: previous.sortKeys[uid] });
+          if (previous.tripId) work.delete("transactions", { ledgerId: `TRIP#${previous.tripId}`, transactionId: previous.sortKey });
+        }
         const ownerState = await work.state(auth.uid),
           type = input.type || "expense";
         ensure(
@@ -931,10 +942,20 @@ export class SplitTrackService {
                 (friend) => friend.id === settlementTarget,
               )
             : undefined;
+        let sourceClaim;
+        if (type === "settlement" && input.sourceTransactionId) {
+          const source = await work.get("ledger", ledgerKey(`JOURNAL#${input.sourceTransactionId}`));
+          ensure(source && !source.deleted && source.effects?.[auth.uid]?.generation === (ownerState.generation || 0), "Split transaction not found.", 404);
+          const sourceRow = await work.get("transactions", { ledgerId: auth.uid, transactionId: source.sortKeys[auth.uid] });
+          ensure(sourceRow?.data.type === "expense" && sourceRow.data.paidBy === auth.uid, "Only the transaction payer can settle its members.", 403);
+          const pair = await work.pair(auth.uid, settlementTarget);
+          sourceClaim = (pair.claims || []).filter(claim => claim.id === input.sourceTransactionId && claim.creditor === auth.uid && claim.debtor === settlementTarget).reduce((sum, claim) => sum + claim.remainingCents, 0);
+          ensure(sourceClaim > 0, "This member is already settled for this transaction.", 409);
+        }
         const total = Math.abs(
           cents(
             input.amount ??
-              (settlementFriend
+              (sourceClaim ? amount(sourceClaim) : settlementFriend
                 ? amount(Math.abs(settlementFriend.netCents))
                 : undefined),
           ),
@@ -993,14 +1014,11 @@ export class SplitTrackService {
           const target = settlementTarget,
             friend = settlementFriend;
           ensure(
-            friend && friend.netCents !== 0,
+            friend && (sourceClaim || friend.netCents !== 0),
             "There is no outstanding balance with this member.",
           );
-          ensure(
-            total <= Math.abs(friend.netCents),
-            "The payment exceeds the outstanding balance.",
-          );
-          signedAmount = friend.netCents > 0 ? total : -total;
+          ensure(sourceClaim || friend.netCents > 0, "Only the member owed the combined balance can record a settlement.", 403);
+          signedAmount = total;
           payer = signedAmount > 0 ? target : auth.uid;
           participants = [
             { uid: auth.uid, shareCents: 0, paidCents: 0 },
@@ -1019,6 +1037,9 @@ export class SplitTrackService {
             (await work.profile(participant.uid))?.username,
             "Every participant needs a registered profile.",
           );
+        // Removed split participants keep a corrected history projection with
+        // zero share, including any overpayment left by the original entry.
+        if (previous) for (const uid of previous.participantIds) if (!participants.some(p => p.uid === uid)) participants.push({ uid, shareCents: 0, paidCents: 0 });
         const effects = {};
         for (const participant of participants) {
           const state = await work.state(participant.uid);
@@ -1074,7 +1095,20 @@ export class SplitTrackService {
           work.stateChanged(participant.uid);
           effects[participant.uid] = effect;
         }
-        for (const flow of flows) await this.applyFlow(work, flow, id);
+        for (const flow of flows) {
+          if (type === "settlement") {
+            const pair = await work.pair(flow.creditor, flow.debtor);
+            applySettlementFlow(pair, flow, id, input.sourceTransactionId);
+            work.rowChanged(pair);
+            mutateNumber(await this.link(work, flow.creditor, flow.debtor), "netCents", flow.cents);
+            mutateNumber(await this.link(work, flow.debtor, flow.creditor), "netCents", -flow.cents);
+          } else await this.applyFlow(work, flow, id);
+        }
+        if (previous) for (const flow of previous.flows) {
+          const pair = await work.pair(flow.creditor, flow.debtor);
+          pair.claims = pair.claims.map(claim => claim.id === `reversal#${id}` ? { ...claim, id } : claim);
+          work.rowChanged(pair);
+        }
         if (options.recurring) {
           const expected = options.recurring,
             key = { ledgerId: auth.uid, recurringId: expected.recurringId },
@@ -1108,7 +1142,7 @@ export class SplitTrackService {
         }
         const sortKey = `TX#${date}#${createdAt}#${id}`,
           pairs = [
-            ...new Set(flows.map((flow) => pairId(flow.creditor, flow.debtor))),
+            ...new Set([...flows, ...(previous?.flows || [])].map((flow) => pairId(flow.creditor, flow.debtor))),
           ];
         const base = {
           id,
@@ -1135,6 +1169,7 @@ export class SplitTrackService {
           location: optionalText(input.location, 200) || undefined,
           notes: optionalText(input.notes, 1000) || undefined,
           creatorId: auth.uid,
+          sourceTransactionId: input.sourceTransactionId,
           toAccountId: type === "transfer" ? input.toAccountId : undefined,
         };
         const sortKeys = {};
@@ -1180,19 +1215,22 @@ export class SplitTrackService {
           "ledger",
           {
             ...ledgerKey(`JOURNAL#${id}`),
-            revision: 1,
+            revision: previous ? previous.revision + 1 : 1,
             id,
             creatorId: auth.uid,
+            payerId: payer,
+            sourceTransactionId: input.sourceTransactionId,
+            type,
             sortKey,
             sortKeys,
             participantIds: participants.map((p) => p.uid),
             effects,
-            flows,
+            flows: [...flows, ...(previous?.flows || []).filter(old => !flows.some(flow => pairId(flow.creditor, flow.debtor) === pairId(old.creditor, old.debtor))).map(old => ({ ...old, cents: 0 }))],
             tripId: trip?.id,
             tripSpendCents: trip ? total : 0,
             createdAt,
           },
-          { revision: 0 },
+          { revision: previous?.revision || 0 },
         );
         return { id };
       },
@@ -1206,6 +1244,7 @@ export class SplitTrackService {
       title: body.title || "Settlement",
       upiAccountId: body.accountId,
       date: body.date,
+      sourceTransactionId: body.transactionId,
     });
   }
   async deleteTransaction(auth, requestId, id) {
@@ -1214,19 +1253,44 @@ export class SplitTrackService {
       requestId,
       { operation: "deleteTransaction", id },
       async (work) => {
-        const lookup = await work.get("data", {
-          userId: auth.uid,
-          recordId: `TX#${id}`,
-        });
-        ensure(lookup, "Transaction not found.", 404);
-        const journal = await work.get("ledger", ledgerKey(`JOURNAL#${id}`));
-        ensure(journal, "Transaction not found.", 404);
-        ensure(
-          journal.creatorId === auth.uid,
-          "Only the person who added this transaction can delete it.",
-          403,
-        );
+        const journal = await this.transactionJournal(work, auth, id);
         if (journal.deleted) return { id, deleted: true };
+        await this.reverseTransaction(work, journal);
+        const deletedAt = new Date().toISOString();
+        const expiresAt = Math.floor(Date.now() / 1000) + 7 * 86400;
+        for (const uid of journal.participantIds) {
+          const row = await work.get("transactions", { ledgerId: uid, transactionId: journal.sortKeys[uid] });
+          if (row) {
+            work.put("transactions", { ...row, deleted: true, deletedAt, expiresAt });
+            work.put("ledger", { ...ledgerKey(uid, `BIN#${deletedAt}#${id}`), revision: 1, id, data: row.data, deletedAt, expiresAt, generation: journal.effects[uid]?.generation, ownerId: auth.uid });
+          }
+          const lookup = await work.get("data", { userId: uid, recordId: `TX#${id}` });
+          if (lookup) work.put("data", { ...lookup, expiresAt });
+        }
+        if (journal.tripId) {
+          const row = await work.get("transactions", { ledgerId: `TRIP#${journal.tripId}`, transactionId: journal.sortKey });
+          if (row) work.put("transactions", { ...row, deleted: true, deletedAt, expiresAt });
+        }
+        journal.deleted = true;
+        journal.deletedAt = deletedAt;
+        journal.expiresAt = expiresAt;
+        work.rowChanged(journal);
+        return { id, deleted: true };
+      },
+    );
+  }
+  async transactionJournal(work, auth, id) {
+    const lookup = await work.get("data", { userId: auth.uid, recordId: `TX#${id}` });
+    const journal = lookup && await work.get("ledger", ledgerKey(`JOURNAL#${id}`));
+    ensure(journal && (!journal.expiresAt || journal.expiresAt > Math.floor(Date.now() / 1000)), "Transaction not found.", 404);
+    const row = await work.get("transactions", { ledgerId: auth.uid, transactionId: lookup.sortKey });
+    const owner = row?.data.type === "expense" ? journal.payerId || row.data.paidBy : journal.creatorId;
+    ensure(owner === auth.uid, "Only the transaction owner can edit, delete or restore it.", 403);
+    // Older journals retain this association on their history projection.
+    journal.sourceTransactionId ||= row?.data.sourceTransactionId;
+    return journal;
+  }
+  async reverseTransaction(work, journal) {
         for (const [uid, effect] of Object.entries(journal.effects)) {
           const state = await work.state(uid);
           ensure(
@@ -1238,8 +1302,14 @@ export class SplitTrackService {
           await this.dailyEffect(work, uid, effect, -1);
           work.stateChanged(uid);
         }
-        for (const flow of journal.flows)
-          await this.applyFlow(work, flow, id, true);
+        for (const flow of journal.flows) {
+          await this.applyFlow(work, flow, journal.id, true);
+          if (journal.sourceTransactionId) {
+            const pair = await work.pair(flow.creditor, flow.debtor);
+            pair.claims = pair.claims.map(claim => claim.id === `reversal#${journal.id}` ? { ...claim, id: journal.sourceTransactionId } : claim);
+            work.rowChanged(pair);
+          }
+        }
         if (journal.tripId) {
           const trip = await work.trip(journal.tripId);
           trip.totalSpendCents -= journal.tripSpendCents;
@@ -1257,25 +1327,62 @@ export class SplitTrackService {
             work.stateChanged(member);
           }
         }
-        for (const uid of journal.participantIds) {
-          const row = await work.get("transactions", {
-            ledgerId: uid,
-            transactionId: journal.sortKeys[uid],
-          });
-          if (row) work.put("transactions", { ...row, deleted: true });
-        }
-        if (journal.tripId) {
-          const row = await work.get("transactions", {
-            ledgerId: `TRIP#${journal.tripId}`,
-            transactionId: journal.sortKey,
-          });
-          if (row) work.put("transactions", { ...row, deleted: true });
-        }
-        journal.deleted = true;
-        work.rowChanged(journal);
-        return { id, deleted: true };
-      },
-    );
+  }
+  async editTransaction(auth, requestId, id, body) {
+    const current = await this.getTransaction(auth, id);
+    ensure(!body.type || body.type === current.type, "The transaction type cannot change.");
+    return this.transaction(auth, requestId, { ...current, ...body, type: current.type }, { id, replace: true, hashInput: body });
+  }
+  async restoreTransaction(auth, requestId, id) {
+    return this.mutation(auth, requestId, { operation: "restoreTransaction", id }, async work => {
+      const journal = await this.transactionJournal(work, auth, id);
+      if (!journal.deleted) return { id, restored: true };
+      for (const [uid, effect] of Object.entries(journal.effects)) {
+        const state = await work.state(uid);
+        ensure((state.generation || 0) === effect.generation, "This transaction belongs to an erased ledger.", 409);
+        this.applyEffect(state, effect); await this.dailyEffect(work, uid, effect); work.stateChanged(uid);
+      }
+      for (const flow of journal.flows) {
+        if (journal.type === "settlement") {
+          const pair = await work.pair(flow.creditor, flow.debtor);
+          applySettlementFlow(pair, flow, id, journal.sourceTransactionId);
+          work.rowChanged(pair);
+          mutateNumber(await this.link(work, flow.creditor, flow.debtor), "netCents", flow.cents);
+          mutateNumber(await this.link(work, flow.debtor, flow.creditor), "netCents", -flow.cents);
+        } else await this.applyFlow(work, flow, id);
+      }
+      if (journal.tripId) {
+        const trip = await work.trip(journal.tripId);
+        ensure(!trip.deleted, "Restore is unavailable for an archived trip.", 409);
+        trip.totalSpendCents += journal.tripSpendCents; work.rowChanged(trip);
+        for (const uid of trip.members) { const state = await work.state(uid); state.trips = state.trips.map(t => t.id === trip.id ? structuredClone(trip) : t); work.stateChanged(uid); }
+      }
+      for (const uid of journal.participantIds) {
+        const row = await work.get("transactions", { ledgerId: uid, transactionId: journal.sortKeys[uid] });
+        ensure(row, "This transaction has expired.", 410);
+        const { deleted, deletedAt, expiresAt, ...active } = row; work.put("transactions", active);
+        const lookup = await work.get("data", { userId: uid, recordId: `TX#${id}` });
+        if (lookup) { const { expiresAt, ...activeLookup } = lookup; work.put("data", activeLookup); }
+        work.delete("ledger", ledgerKey(uid, `BIN#${journal.deletedAt}#${id}`));
+      }
+      if (journal.tripId) {
+        const row = await work.get("transactions", { ledgerId: `TRIP#${journal.tripId}`, transactionId: journal.sortKey });
+        ensure(row, "This transaction has expired.", 410);
+        const { deleted, deletedAt, expiresAt, ...active } = row; work.put("transactions", active);
+      }
+      delete journal.deleted; delete journal.deletedAt; delete journal.expiresAt;
+      work.rowChanged(journal); return { id, restored: true };
+    });
+  }
+  async transactionBin(auth) {
+    const state = (await this.repo.get("ledger", ledgerKey(auth.uid))) || emptyState(auth.uid);
+    const rows = []; let cursor;
+    do {
+      const page = await this.repo.query("ledger", "ledgerId", auth.uid, { prefix: "BIN#", reverse: true, limit: 100, cursor });
+      rows.push(...page.items.filter(row => row.expiresAt > Math.floor(Date.now() / 1000) && row.generation === (state.generation || 0)));
+      cursor = page.cursor;
+    } while (cursor && rows.length < 500);
+    return { items: rows.map(row => ({ ...row.data, paidBy: alias(row.data.paidBy, auth.uid), splits: (row.data.splits || []).map(s => ({ ...s, friendId: alias(s.friendId, auth.uid) })), deletedAt: row.deletedAt, expiresAt: row.expiresAt, canRestore: row.ownerId === auth.uid })) };
   }
   async getTransaction(auth, id) {
     const lookup = await this.repo.get("data", {
@@ -1316,6 +1423,7 @@ export class SplitTrackService {
       })),
       settled: remaining === 0,
       remainingAmount: amount(remaining),
+      settlementVector: settlementVector(row.data, pairs, auth.uid),
     };
   }
   async tripHistory(auth, id, options) {
@@ -1568,11 +1676,11 @@ export class SplitTrackService {
             if (id) work.delete("data", { userId: auth.uid, recordId: `TX#${id}` });
           }
           if (!page.items.length) reset.stage++;
-        } else if (reset.stage <= 6) {
-          const table = ["ledger", "ledger", "data", "recurring", "templates"][reset.stage - 2];
+        } else if (reset.stage <= 7) {
+          const table = ["ledger", "ledger", "data", "recurring", "templates", "ledger"][reset.stage - 2];
           const partition = table === "data" ? "userId" : "ledgerId";
           const value = reset.stage === 2 ? `ANALYTICS#${auth.uid}` : auth.uid;
-          const page = await this.repo.query(table, partition, value, { ...(table === "ledger" ? { prefix: "DAY#" } : table === "data" ? { prefix: "TX#" } : {}), limit: 80 });
+          const page = await this.repo.query(table, partition, value, { ...(table === "ledger" ? { prefix: reset.stage === 7 ? "BIN#" : "DAY#" } : table === "data" ? { prefix: "TX#" } : {}), limit: 80 });
           for (const row of page.items) {
             const sortKey = { ledger: "recordId", data: "recordId", recurring: "recurringId", templates: "templateId" }[table];
             work.delete(table, { [partition]: value, [sortKey]: row[sortKey] });
@@ -1760,6 +1868,7 @@ export class SplitTrackService {
       })),
       settled: !(remaining.get(row.data.id) > 0),
       remainingAmount: amount(remaining.get(row.data.id) || 0),
+      settlementVector: settlementVector(row.data, pairs, uid),
     }));
     return {
       items,

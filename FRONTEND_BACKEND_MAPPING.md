@@ -25,9 +25,13 @@ EXPO_PUBLIC_GOOGLE_PLACES_API_KEY=
 | Real member search | `/api/users/search?q=name-or-@handle` | GET | Public profiles; names can repeat, usernames are unique. |
 | Avatar/cover upload | `/api/media` | POST | `{ reference, url }`; JPEG/PNG/WebP, maximum 3 MB, deterministic content key. |
 | `addTransaction` | `/transactions` | POST | Atomic expense/income/transfer and server-calculated balances/analytics. |
-| `settleWithFriend` | `/api/settlements` | POST | `{ friendId, amount?, accountId? }`; supports partial/full payments. |
+| `settleWithFriend` | `/api/settlements` | POST | Combined creditor confirms partial/full/excess payment; residual debt moves to this payment. |
 | `importTransactions` | `/transactions/batch` | POST | 1–50 entries; individual transactions and stable per-entry retry keys. |
-| Individual transaction | `/transactions/{id}` | GET/DELETE | Caller-visible history; creator-only financial reversal. |
+| Individual transaction | `/transactions/{id}` | GET/DELETE | Caller-visible history; expense payer (other types: creator) controls financial reversal and seven-day bin. |
+| Edit transaction | `/api/transactions/{id}` | PUT | Owner-controlled atomic replacement of balances, shares, analytics and trip totals; stable transaction ID. |
+| Settle one split member | `/api/transactions/{id}/settle` | POST | `{ friendId, amount, accountId? }`; only the expense payer confirms receipt. |
+| Transaction bin | `/api/transactions/bin` | GET | Caller-visible deleted entries and owner-only `canRestore`, with seven-day expiry. |
+| Restore transaction | `/api/transactions/{id}/restore` | POST | Owner re-applies financial effects before expiry; ledger-generation checks prevent restoring erased data. |
 | Paginated history | `/transactions?limit=50&cursor=...` | GET | `{ items, cursor }`, scoped to caller/current generation. |
 | Link/edit/remove member | `/entities/friends/{uid}` | PUT/DELETE | Registered members; deletion requires settled debts and no shared trip. |
 | Create/edit/archive trip | `/entities/trips/{id}` | PUT/DELETE | Creator-controlled canonical trip and member projections. |
@@ -41,7 +45,7 @@ EXPO_PUBLIC_GOOGLE_PLACES_API_KEY=
 | Recurring rules | `/recurring`, `/recurring/due`, `/recurring/{id}` | GET/POST/PUT/DELETE | Rules filtered to the current generation. |
 | Process/skip recurring | `/recurring/{id}/process`, `/recurring/{id}/skip` | POST | Server-validated due-date advance; processing uses an occurrence key. |
 | State hydration | `/state` | GET | Schema-version-2 cloud snapshot. |
-| Fresh ledger | `/state/erase`, or DELETE `/state` | POST/DELETE | New generation; hides prior history and retains existing AWS records. |
+| Fresh ledger | `/state/erase`, or DELETE `/state` | POST/DELETE | Resumable physical deletion of old ledger data, bin, accounts and trips, including unpaid debts; preserves profile/preferences. |
 | Health/changelog | `/health`, `/changelog` | GET | Public information. |
 | Admin publication | `/admin/changelog` | POST | Existing `x-admin-key`; never expose it in a mobile build. |
 
@@ -51,8 +55,8 @@ All protected routes require `Authorization: Bearer <Firebase ID token>`. Mutati
 
 Mutation responses normally contain `{ result, state }`. Snapshots include `schemaVersion: 2`, `userId`, `revision`, `profile`, `accounts`, `friends`, `trips`, `categories`, `transactions`, `transactionCursor`, `settings`, and all-time/category/month `summary` aggregates. API amounts are rupees; calculations/storage use integer paise. `user` aliases the authenticated caller; other IDs must identify registered members. Caller-controlled `x-user-id` is ignored.
 
-A ₹70.30 expense split equally between two people produces a ₹35.15 debt. Paying ₹30.15 leaves ₹5 and keeps the expense unsettled. Deletions reverse financial effects rather than losing the payment history. Complete-state PUT/POST is rejected with `405`; legacy `/auth/signup`, `/auth/signin`, `/auth/google` routes are retired in favor of Firebase.
+A ₹70.30 expense split equally between two people produces a ₹35.15 debt. A combined-creditor-confirmed ₹30.15 payment clears older pair vectors and carries the remaining ₹5 on the payment. Receiving ₹8 next creates a reversed ₹3 debt on the new payment. Individual settlement clears the selected member's source vector and any other claims reached by excess payment; unrelated members remain outstanding. Transaction details expose `settlementVector` with per-member remaining amounts and creditor/debtor directions. Deletion immediately reverses balances and moves all participant projections to the bin; restore re-applies them atomically. Complete-state PUT/POST is rejected with `405`; legacy `/auth/signup`, `/auth/signin`, `/auth/google` routes are retired in favor of Firebase.
 
 Errors return `{ message, code }` with their HTTP status. Clients refresh tokens after 401 and retry transient failures using the original key. Active forms retain their submitted draft/key while retrying. There is no offline financial outbox or draft recovery across app relaunches; inspect history before manually reentering an uncertain save after relaunching. Failed imports can be partially saved; retry the original batch key or review the ledger.
 
-Existing table usage: `SplitTrackData` holds profiles, username/search rows and transaction lookups; `SplitTrackLedgerData` holds user state, canonical trips, outstanding pair claims, journals, analytics and request markers; `SplitTrackTransactions` holds user/trip projections with generation prefixes and reversal tombstones. The existing recurring/template/changelog tables retain their respective features. Queries and batch reads avoid scanning financial history for snapshots. Conditional revisions and DynamoDB transactions protect balances/projections together. Only request markers have `expiresAt` for TTL; existing historical records are retained.
+Existing table usage: `SplitTrackData` holds profiles, username/search rows and transaction lookups; `SplitTrackLedgerData` holds user state, canonical trips, outstanding pair claims, journals, analytics, bin entries and request markers; `SplitTrackTransactions` holds user/trip projections with generation prefixes. The existing recurring/template/changelog tables retain their respective features. Queries and batch reads avoid scanning financial history for snapshots. Conditional revisions and DynamoDB transactions protect balances/projections together. TTL on the three existing data tables uses `expiresAt` for request markers and deleted journals, lookups, projections and bin entries. Deleted transactions become unavailable for restore exactly at seven days; DynamoDB physically removes expired records asynchronously afterward. Active history has no expiry.

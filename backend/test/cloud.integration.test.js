@@ -121,21 +121,21 @@ test("expense, partial payment and deletion preserve both users and trip totals"
   assert.equal(created.state.summary.totalExpenses, 35.15);
   assert.equal(created.state.accounts[0].balance, -70.3);
   assert.equal(created.state.trips[0].totalSpend, 70.3);
-  const payment = await app.settle(bob, request(), {
-    friendId: alice.uid,
+  const payment = await app.settle(alice, request(), {
+    friendId: bob.uid,
     amount: 30.15,
   });
-  assert.equal(balance(payment.state, alice.uid), -5);
+  assert.equal(balance(payment.state, bob.uid), 5);
   const aliceState = await app.snapshot(alice.uid);
   assert.equal(balance(aliceState, bob.uid), 5);
   assert.equal(aliceState.accounts[0].balance, -40.15);
   assert.equal(
     (await app.getTransaction(alice, created.result.id)).settled,
-    false,
+    true,
   );
   assert.equal(
     (await app.getTransaction(alice, created.result.id)).remainingAmount,
-    5,
+    0,
   );
   await app.deleteTransaction(alice, request(), created.result.id);
   const afterAlice = await app.snapshot(alice.uid),
@@ -145,7 +145,7 @@ test("expense, partial payment and deletion preserve both users and trip totals"
   assert.equal(afterAlice.summary.totalExpenses, 0);
   assert.equal(afterBob.summary.totalExpenses, 0);
   assert.equal(afterAlice.trips[0].totalSpend, 0);
-  await app.deleteTransaction(bob, request(), payment.result.id);
+  await app.deleteTransaction(alice, request(), payment.result.id);
   assert.equal(balance(await app.snapshot(alice.uid), bob.uid), 0);
   assert.equal(balance(await app.snapshot(bob.uid), alice.uid), 0);
   const pair = await repo.get("ledger", {
@@ -281,7 +281,7 @@ test("fresh ledger removes unsettled splits and trips without blocking or replay
   await app.settings(alice, request(), { selectionStyle: "dropdown", themeMode: "light" });
   await app.saveEntity(alice, request(), "trips", "fresh-trip", { name: "Test trip", startDate: "2026-11-18", members: ["user", bob.uid], coverGradient: ["#123456", "#654321"] });
   const tx = await app.transaction(alice, request(), { ...expense, tripId: "fresh-trip" });
-  await app.settle(bob, request(), { friendId: alice.uid, amount: 10 });
+  await app.settle(alice, request(), { friendId: bob.uid, amount: 10 });
   await app.saveEntity(alice, request(), "templates", "old-template", { name: "Saved expense", amount: 10, transactionType: "expense" });
   const id = request();
   const reset = await app.erase(alice, id);
@@ -484,11 +484,11 @@ test("retrying a complete settlement returns the original payment even after bal
   const { app } = await setup();
   await app.transaction(alice, request(), expense);
   const key = request(),
-    body = { friendId: alice.uid };
-  const first = await app.settle(bob, key, body),
-    again = await app.settle(bob, key, body);
+    body = { friendId: bob.uid };
+  const first = await app.settle(alice, key, body),
+    again = await app.settle(alice, key, body);
   assert.equal(first.result.id, again.result.id);
-  assert.equal(balance(again.state, alice.uid), 0);
+  assert.equal(balance(again.state, bob.uid), 0);
   assert.equal(
     again.state.transactions.filter((tx) => tx.type === "settlement").length,
     1,
@@ -525,7 +525,7 @@ test("analytics uses each participant share and excludes payments and transfers"
     ...expense,
     time: "09:30",
   });
-  await app.settle(bob, request(), { friendId: alice.uid, amount: 30.15 });
+  await app.settle(alice, request(), { friendId: bob.uid, amount: 30.15 });
   let month = await app.analytics(alice, {
     period: "Month",
     year: 2026,
@@ -541,13 +541,11 @@ test("analytics uses each participant share and excludes payments and transfers"
   assert.equal(month.totalExpenses, 0);
   assert.deepEqual(month.categories, {});
 });
-test("payments cannot exceed a debt and fresh start disables old recurring rules", async () => {
+test("overpayments reverse debt and fresh start disables old recurring rules", async () => {
   const { app } = await setup();
   await app.transaction(alice, request(), expense);
-  await assert.rejects(
-    app.settle(bob, request(), { friendId: alice.uid, amount: 40 }),
-    /exceeds/,
-  );
+  const paid = await app.settle(alice, request(), { friendId: bob.uid, amount: 40 });
+  assert.equal(balance(paid.state, bob.uid), -4.85);
   await app.settle(bob, request(), { friendId: alice.uid });
   await app.saveEntity(alice, request(), "recurring", "old-rule", {
     name: "Old",
@@ -560,4 +558,129 @@ test("payments cannot exceed a debt and fresh start disables old recurring rules
     app.processRecurring(alice, "old-rule"),
     (error) => error.status === 404,
   );
+});
+
+test("bulk settlement is creditor-only, consolidates previous vectors and preserves overpayment", async () => {
+  const { app, repo } = await setup();
+  const first = await app.transaction(alice, request(), expense);
+  const second = await app.transaction(alice, request(), expense);
+  await assert.rejects(app.settle(bob, request(), { friendId: alice.uid, amount: 1 }), error => error.status === 403);
+  const paid = await app.settle(alice, request(), { friendId: bob.uid, amount: 60 });
+  assert.equal(balance(paid.state, bob.uid), 10.3);
+  for (const id of [first.result.id, second.result.id]) {
+    const tx = await app.getTransaction(alice, id);
+    assert.equal(tx.settled, true);
+    assert.ok(tx.settlementVector.every(v => v.remainingAmount === 0));
+  }
+  assert.equal((await app.getTransaction(alice, paid.result.id)).remainingAmount, 10.3);
+  const overpaid = await app.settle(alice, request(), { friendId: bob.uid, amount: 15 });
+  assert.equal(balance(overpaid.state, bob.uid), -4.7);
+  const vector = (await app.getTransaction(bob, overpaid.result.id)).settlementVector;
+  assert.equal(vector[0].balances[0].creditorId, 'user');
+  assert.equal(vector[0].remainingAmount, 4.7);
+  await app.deleteTransaction(alice, request(), overpaid.result.id);
+  assert.equal(balance(await app.snapshot(alice.uid), bob.uid), 10.3);
+  await app.restoreTransaction(alice, request(), overpaid.result.id);
+  assert.equal(balance(await app.snapshot(alice.uid), bob.uid), -4.7);
+  const pair = await repo.get('ledger', { ledgerId: pairId(alice.uid, bob.uid), recordId: 'STATE' });
+  assert.equal(pair.claims.reduce((sum,c) => sum + (c.creditor === alice.uid ? c.remainingCents : -c.remainingCents), 0), -470);
+});
+
+test("only the actual expense payer settles individual members, with partial and spillover", async () => {
+  const { app } = await setup();
+  const carol = { uid: 'carolTestUid', email: 'carol@example.invalid', name: 'Carol' };
+  await app.bootstrap(carol); await app.updateProfile(carol, request(), { username: 'carol_test' });
+  await app.saveEntity(alice, request(), 'friends', carol.uid, { userId: carol.uid });
+  const tx = await app.transaction(alice, request(), { ...expense, amount: 90, splits: [{friendId:'user',paidAmount:90},{friendId:bob.uid},{friendId:carol.uid}] });
+  await assert.rejects(app.settle(bob, request(), { transactionId: tx.result.id, friendId: alice.uid, amount: 10 }), error => error.status === 403);
+  const partial = await app.settle(alice, request(), { transactionId: tx.result.id, friendId: bob.uid, amount: 10 });
+  const source = await app.getTransaction(alice, tx.result.id);
+  assert.equal(source.settlementVector.find(v=>v.memberId === bob.uid).remainingAmount, 0);
+  assert.equal(source.settlementVector.find(v=>v.memberId === carol.uid).remainingAmount, 30);
+  assert.equal((await app.getTransaction(alice, partial.result.id)).remainingAmount, 20);
+  await app.settle(alice, request(), { transactionId: tx.result.id, friendId: carol.uid, amount: 35 });
+  assert.equal((await app.getTransaction(alice, tx.result.id)).settled, true);
+  assert.equal(balance(await app.snapshot(alice.uid), carol.uid), -5);
+  const another = await app.transaction(alice, request(), expense);
+  await app.settle(alice, request(), { transactionId: another.result.id, friendId: bob.uid, amount: 40 });
+  assert.equal((await app.getTransaction(alice, another.result.id)).settled, true);
+  assert.equal(balance(await app.snapshot(alice.uid), bob.uid), 15.15);
+});
+
+test("owner edits an already partly settled split atomically and bin restores it within seven days", async () => {
+  const { app, repo } = await setup();
+  const tx = await app.transaction(alice, request(), expense);
+  await app.settle(alice, request(), { friendId: bob.uid, amount: 10 });
+  await assert.rejects(app.editTransaction(bob, request(), tx.result.id, {title:'Forged'}), error=>error.status===403);
+  const edited = await app.editTransaction(alice, request(), tx.result.id, { amount: 100, splitType: 'equal', splits: [{friendId:'user',paidAmount:100},{friendId:bob.uid,paidAmount:0}], title:'Updated stay' });
+  assert.equal(edited.result.id, tx.result.id);
+  assert.equal(balance(edited.state,bob.uid),40);
+  assert.equal(edited.state.summary.totalExpenses,50);
+  assert.equal(edited.state.transactions.filter(t=>t.id===tx.result.id).length,1);
+  await assert.rejects(app.deleteTransaction(bob,request(),tx.result.id),error=>error.status===403);
+  const removed=await app.deleteTransaction(alice,request(),tx.result.id);
+  assert.equal(removed.state.summary.totalExpenses,0);
+  assert.equal(balance(removed.state,bob.uid),-10);
+  const bin=await app.transactionBin(alice);
+  assert.equal(bin.items[0].title,'Updated stay');
+  assert.ok(bin.items[0].expiresAt*1000-Date.now() > 6.99*86400000);
+  await assert.rejects(app.restoreTransaction(bob,request(),tx.result.id),error=>error.status===403);
+  await app.restoreTransaction(alice,request(),tx.result.id);
+  assert.equal((await app.transactionBin(alice)).items.length,0);
+  assert.equal(balance(await app.snapshot(alice.uid),bob.uid),40);
+  await app.deleteTransaction(alice,request(),tx.result.id);
+  const key={ledgerId:`JOURNAL#${tx.result.id}`,recordId:'STATE'};
+  const journal=await repo.get('ledger',key);
+  journal.expiresAt=Math.floor(Date.now()/1000)-1;
+  await repo.transact([{type:'put',table:'ledger',item:journal}]);
+  await assert.rejects(app.restoreTransaction(alice,request(),tx.result.id),error=>error.status===404);
+});
+
+test("transaction payer owns a split added by a different member and edits are retry-safe", async () => {
+  const { app, repo } = await setup();
+  const created=await app.transaction(bob,request(),{...expense,paidBy:alice.uid,splits:[{friendId:alice.uid,paidAmount:70.3},{friendId:'user',paidAmount:0}]});
+  await assert.rejects(app.deleteTransaction(bob,request(),created.result.id),error=>error.status===403);
+  await assert.rejects(app.settle(bob,request(),{transactionId:created.result.id,friendId:alice.uid,amount:5}),error=>error.status===403);
+  const payment=await app.settle(alice,request(),{transactionId:created.result.id,friendId:bob.uid,amount:5});
+  assert.equal(balance(payment.state,bob.uid),30.15);
+  const key=request(), body={title:'Corrected title'};
+  const first=await app.editTransaction(alice,key,created.result.id,body);
+  const again=await app.editTransaction(alice,key,created.result.id,body);
+  assert.equal(balance(first.state,bob.uid),30.15);
+  assert.equal(balance(again.state,bob.uid),30.15);
+  repo.failNext=true;
+  await assert.rejects(app.editTransaction(alice,request(),created.result.id,{amount:200,splitType:'equal',splits:[{friendId:'user',paidAmount:200},{friendId:bob.uid,paidAmount:0}]}),/Injected/);
+  assert.equal(balance(await app.snapshot(alice.uid),bob.uid),30.15);
+});
+
+test("editing participants preserves overpaid credit and later deletion reverses it", async () => {
+  const { app } = await setup();
+  const tx = await app.transaction(alice, request(), expense);
+  await app.settle(alice, request(), {friendId:bob.uid,amount:20});
+  const changed = await app.editTransaction(alice, request(), tx.result.id, {amount:10,splitType:'equal',splits:[{friendId:'user',paidAmount:10}]});
+  assert.equal(balance(changed.state,bob.uid),-20);
+  const entry=await app.getTransaction(bob,tx.result.id);
+  assert.equal(entry.remainingAmount,20);
+  assert.equal(entry.settlementVector[0].balances[0].creditorId,'user');
+  await app.deleteTransaction(alice,request(),tx.result.id);
+  assert.equal(balance(await app.snapshot(alice.uid),bob.uid),-20);
+  await app.restoreTransaction(alice,request(),tx.result.id);
+  assert.equal(balance(await app.snapshot(alice.uid),bob.uid),-20);
+});
+
+test("restoring and editing an individual payment preserves unrelated transaction vectors", async () => {
+  const { app } = await setup();
+  const unrelated = await app.transaction(alice, request(), expense);
+  const source = await app.transaction(alice, request(), expense);
+  const payment = await app.settle(alice, request(), { transactionId: source.result.id, friendId: bob.uid, amount: 10 });
+  await app.deleteTransaction(alice, request(), payment.result.id);
+  assert.equal((await app.getTransaction(alice, source.result.id)).remainingAmount, 35.15);
+  await app.restoreTransaction(alice, request(), payment.result.id);
+  assert.equal((await app.getTransaction(alice, unrelated.result.id)).remainingAmount, 35.15);
+  assert.equal((await app.getTransaction(alice, source.result.id)).remainingAmount, 0);
+  assert.equal((await app.getTransaction(alice, payment.result.id)).remainingAmount, 25.15);
+  await app.editTransaction(alice, request(), payment.result.id, { amount: 15 });
+  assert.equal((await app.getTransaction(alice, unrelated.result.id)).remainingAmount, 35.15);
+  assert.equal((await app.getTransaction(alice, source.result.id)).remainingAmount, 0);
+  assert.equal((await app.getTransaction(alice, payment.result.id)).remainingAmount, 20.15);
 });

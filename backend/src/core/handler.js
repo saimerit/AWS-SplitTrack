@@ -224,6 +224,11 @@ export function createHandler(
           201,
         );
       }
+      if ((path === "/transactions/bin" || path === "/api/transactions/bin") && method === "GET") return response(await app.transactionBin(auth));
+      const restore = path.match(/^(?:\/api)?\/transactions\/([^/]+)\/restore$/);
+      if (restore && method === "POST") return response(await app.restoreTransaction(auth, requestId, decodeURIComponent(restore[1])));
+      const transactionSettlement = path.match(/^(?:\/api)?\/transactions\/([^/]+)\/settle$/);
+      if (transactionSettlement && method === "POST") return response(await app.settle(auth, requestId, { ...parse(event), transactionId: decodeURIComponent(transactionSettlement[1]) }), 201);
       const transaction = path.match(/^(?:\/api)?\/transactions\/([^/]+)$/);
       if (transaction) {
         const id = decodeURIComponent(transaction[1]);
@@ -231,6 +236,7 @@ export function createHandler(
           return response(await app.getTransaction(auth, id));
         if (method === "DELETE")
           return response(await app.deleteTransaction(auth, requestId, id));
+        if (method === "PUT") return response(await app.editTransaction(auth, requestId, id, parse(event)));
       }
       if (path === "/api/settlements" && method === "POST")
         return response(await app.settle(auth, requestId, parse(event)), 201);
