@@ -31,7 +31,7 @@ Mobile transaction submissions set `duplicateCheck: true`. The server warns with
 
 All financial calculations use integer paise. Shared transactions, user balances, canonical trip projections, daily/monthly analytics and request markers commit in one DynamoDB transaction with conditional revisions and bounded conflict retries. Equal, exact, percentage and share splits are supported. Partial payments consume outstanding claims. Deleting an expense reverses its effects and restores already-paid portions as refund debts; deleting a payment reverses that payment. Only the creator can delete a transaction.
 
-Trip creators manage membership. Removed members lose trip access and retain their financial history and debts. Display names may repeat, while usernames are claimed atomically. Search exposes public names, usernames and avatars; emails and payment-profile lists remain private. Receiving UPI IDs are visible to linked members. Store only the last four card digits.
+Trip creators manage membership. Removed members lose trip access and retain their financial history and debts. Display names may repeat, while usernames are claimed atomically. Search exposes public names, usernames and avatars; emails and payment-profile lists remain private. Receiving UPI IDs, payment names and app/bank branding are visible only in the owner's profile and linked-member snapshots, so both users' payment QRs use the same receiving identity. Public search excludes these receiving fields. Selecting a bank card preserves the receiving UPI profile; changing or removing that profile updates or clears its branding. Store only the last four card digits.
 
 Payment profiles are manually entered ledger profiles, not bank integrations. A UPI QR contains the receiving UPI ID and amount. Users confirm payment in their UPI app; marking it paid records that confirmation and does not independently verify bank settlement.
 
@@ -41,7 +41,7 @@ Cleanup commits in bounded transactions and returns `result.needsContinue` when 
 
 ## Validate and deploy
 
-The latest backend bundle was deployed on **20 November 2026** through reviewed change set `offline-duplicates-20261120-150102`; `splittrack-backend` reached `UPDATE_COMPLETE`. All five existing Lambda code hashes match the validated bundle, with no resource additions, deletions or replacements. Deployment evidence is in ignored `backend/.deployment/deployment-report.md`. Build the separate frontend to receive the new mobile behavior; see [mobile build steps](https://github.com/AdityaRoy999/splitrack/blob/main/docs/mobile-builds.md).
+The latest backend bundle was deployed on **21 November 2026** through reviewed change set `receiving-brand-20261121-212106`; `splittrack-backend` reached `UPDATE_COMPLETE`. All five existing Lambda code hashes match the validated bundle, with no resource additions, deletions or replacements. Deployment evidence is in ignored `backend/.deployment/receiving-brand-20261121/deployment-report.md`. Build the separate frontend to receive the new mobile behavior; see [mobile build steps](https://github.com/AdityaRoy999/splitrack/blob/main/docs/mobile-builds.md).
 
 From `backend/`, run `npm ci` and `npm run validate`. Validation runs financial, concurrency, privacy and Firebase-token tests, then builds one ESM bundle with five small Lambda entry files in ignored `.build/`. The duplicate reference servers and custom password/JWT implementation were retired. See [FRONTEND_BACKEND_MAPPING.md](FRONTEND_BACKEND_MAPPING.md) for the API contract.
 

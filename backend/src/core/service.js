@@ -70,6 +70,12 @@ const usableAccounts = (state) =>
   state.accounts.filter((account) => !account.archived);
 const activeAccount = (state, id) =>
   state.accounts.find((account) => account.id === id && !account.archived);
+const receivingProfileFields = (profile) => ({
+  upiId: profile?.upiId || undefined,
+  paymentName: profile?.upiId ? profile.paymentName || profile.name || undefined : undefined,
+  receivingProvider: profile?.upiId ? profile.receivingProvider || undefined : undefined,
+  receivingBankBrand: profile?.upiId ? profile.receivingBankBrand || undefined : undefined,
+});
 const searchKeys = (profile) =>
   [
     ...new Set(
@@ -298,7 +304,7 @@ export class SplitTrackService {
     const profile = await this.bootstrap(auth);
     return {
       ...(await this.publicProfile(profile)),
-      upiId: profile.upiId || undefined,
+      ...receivingProfileFields(profile),
       email: profile.email,
       username: profile.username,
       displayName: profile.name,
@@ -439,13 +445,23 @@ export class SplitTrackService {
     const state = await work.state(uid),
       profile = await work.profile(uid);
     const selected = activeAccount(state, state.settings.selectedAccountId);
+    const previousReceiver = activeAccount(state, state.settings.receivingAccountId);
     const account =
       selected?.kind === "upi"
         ? selected
-        : activeAccount(state, state.settings.receivingAccountId) ||
+        : (previousReceiver?.kind === "upi" ? previousReceiver : undefined) ||
           usableAccounts(state).find((account) => account.kind === "upi");
     state.settings.receivingAccountId = account?.id || "";
-    if (profile) work.put("data", { ...profile, upiId: account?.upiId || "", paymentName: account?.title || "" });
+    if (profile) {
+      const receiving = {
+        upiId: account?.upiId || "",
+        paymentName: account?.title || "",
+        receivingProvider: account ? account.provider || "bank" : "",
+        receivingBankBrand: account?.bankBrand || "",
+      };
+      if (Object.entries(receiving).some(([key, value]) => (profile[key] || "") !== value))
+        work.put("data", { ...profile, ...receiving });
+    }
   }
   async saveEntity(auth, requestId, type, id, body) {
     return this.mutation(
@@ -2049,8 +2065,7 @@ export class SplitTrackService {
           avatar: await this.media.resolve(
             friend.avatarRef || profile?.avatarRef || "",
           ),
-          upiId: profile?.upiId || undefined,
-          paymentName: profile?.paymentName || profile?.name || undefined,
+          ...receivingProfileFields(profile),
           phone: friend.phone || undefined,
           netBalance: amount(friend.netCents),
         };
@@ -2095,7 +2110,7 @@ export class SplitTrackService {
       transactions: page.items,
       transactionCursor: page.cursor,
       settings: state.settings,
-      profile: profile ? await this.publicProfile(profile) : null,
+      profile: profile ? { ...(await this.publicProfile(profile)), ...receivingProfileFields(profile) } : null,
       summary: {
         totalIncome: amount(totals.incomeCents),
         totalExpenses: amount(totals.expenseCents),
