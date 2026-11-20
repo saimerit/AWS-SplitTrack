@@ -321,6 +321,7 @@ export function createHandler(
               ? "The request could not be completed. Please retry."
               : error.message,
           code: error.code || "INTERNAL_ERROR",
+          ...(status !== 500 && error.details ? { details: error.details } : {}),
         },
         status,
       );

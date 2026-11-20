@@ -27,12 +27,23 @@
 .firebaserc
 google-services.json
 GoogleService-Info.plist
+google-services*.json
+GoogleService-Info*.plist
 *service-account*.json
 *serviceAccount*.json
+*service_account*.json
+firebase-adminsdk*.json
 client_secret*.json
+credentials.json
+.secrets/
+.envrc
+/Access/
+/access/
 
 # AWS, SAM & Cloud Deployment Artifacts
 .aws-sam/
+.aws/
+.deployment/
 samconfig.toml
 samconfig*.toml
 packaged.yaml
