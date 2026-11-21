@@ -18,6 +18,16 @@ await build({
     js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);",
   },
 });
+await build({
+  entryPoints: [path.join(root, "src/core/statementPdfWorker.mjs")],
+  outfile: path.join(out, "statementPdfWorker.mjs"),
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  minify: true,
+  banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+});
 for (const name of ["api", "auth", "state", "health", "changelog"])
   await fs.writeFile(
     path.join(out, "handlers", `${name}.js`),

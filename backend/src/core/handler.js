@@ -4,6 +4,7 @@ import { ApiError, ensure } from "./errors.js";
 import { repository } from "./awsRepository.js";
 import { SplitTrackService } from "./service.js";
 import { MediaService } from "./media.js";
+import { extractStatementPdf } from "./statementPdf.js";
 
 const media = new MediaService(),
   service = new SplitTrackService(repository, media);
@@ -118,6 +119,8 @@ export function createHandler(
       }
       const auth = await verifyAuth(event),
         requestId = header(event, "idempotency-key");
+      if (path === "/api/import/statement/pdf" && method === "POST")
+        return response(await extractStatementPdf(parse(event).base64));
       if (["/auth/signup", "/auth/signin", "/auth/google"].includes(path))
         throw new ApiError(
           410,

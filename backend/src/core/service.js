@@ -36,17 +36,6 @@ const reserved = new Set([
 ]);
 const jsonHash = (value) =>
   crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
-// Separate indexed scopes implement "same group OR same people" without a
-// financial-history scan on each save. Amounts and IDs are already canonical.
-const duplicateScopes = (data) => {
-  const common = [data.type, Math.abs(cents(data.amount)), data.paidBy];
-  const people = [...new Set(data.duplicateParticipantIds || (data.splits?.length ? data.splits.map(split => split.friendId) : data.type === "settlement" ? [data.paidBy, data.creatorId] : [data.paidBy]))].sort();
-  return [...new Set([
-    jsonHash([...common, "people", people]),
-    ...(data.tripId ? [jsonHash([...common, "trip", data.tripId])] : []),
-  ])];
-};
-const duplicateEntryKey = (scope, id) => ledgerKey(`DUPLICATE#${scope}`, `TX#${id}`);
 const keyOf = (table, item) =>
   JSON.stringify(
     table === "data"
@@ -925,99 +914,18 @@ export class SplitTrackService {
     );
     work.rowChanged(row);
   }
-  async backfillDuplicateIndex(partition, prefix, markerKey) {
-    // Legacy projections are indexed once, in resumable bounded pages. New
-    // writes always maintain their index in the financial transaction.
-    for (;;) {
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const work = new Work(this.repo);
-        const marker = await work.get("ledger", markerKey);
-        if (marker?.complete) return;
-        const page = await this.repo.query("transactions", "ledgerId", partition, {
-          prefix, cursor: marker?.cursor, limit: 40,
-        });
-        const journals = await this.repo.many("ledger", page.items.filter(row => !row.deleted && row.data).map(row => ledgerKey(`JOURNAL#${row.id}`)));
-        const byId = new Map(journals.map(journal => [journal.id, journal]));
-        for (const row of page.items) {
-          if (row.deleted || !row.data) continue;
-          for (const scope of duplicateScopes({ ...row.data, duplicateParticipantIds: byId.get(row.id)?.duplicateParticipantIds }))
-            work.put("ledger", { ...duplicateEntryKey(scope, row.id), id: row.id });
-        }
-        work.put("ledger", {
-          ...markerKey, revision: (marker?.revision || 0) + 1,
-          complete: !page.cursor, ...(page.cursor ? { cursor: page.cursor } : {}),
-        }, { revision: marker?.revision || 0 });
-        try { await work.commit(); break; }
-        catch (error) {
-          if (!this.isConflict(error) || attempt === 4) throw error;
-        }
-      }
-    }
-  }
-  async duplicateCandidate(work, auth, scopes, trip, excludeId) {
-    const state = await work.state(auth.uid);
-    for (const scope of scopes) {
-      // A conditional revision on the scope serializes concurrent matching
-      // submissions, including submissions from different group members.
-      const lockKey = ledgerKey(`DUPLICATE#${scope}`);
-      const lock = await work.get("ledger", lockKey) || { ...lockKey, revision: 0 };
-      work.rowChanged(lock);
-      let cursor;
-      do {
-        const page = await this.repo.query("ledger", "ledgerId", lockKey.ledgerId, { prefix: "TX#", cursor, limit: 40 });
-        const ids = page.items.filter(item => item.id !== excludeId).map(item => item.id);
-        const [lookups, journals] = await Promise.all([
-          this.repo.many("data", ids.map(id => ({ userId: auth.uid, recordId: `TX#${id}` }))),
-          this.repo.many("ledger", ids.map(id => ledgerKey(`JOURNAL#${id}`))),
-        ]);
-        const byId = new Map(lookups.map(row => [row.id, row]));
-        const journalById = new Map(journals.map(row => [row.id, row]));
-        const keys = [];
-        for (const item of page.items) {
-          if (item.id === excludeId) continue;
-          const journal = journalById.get(item.id), lookup = byId.get(item.id);
-          if (!journal || journal.deleted) continue;
-          if (lookup && journal.effects?.[auth.uid]?.generation === (state.generation || 0))
-            keys.push({ ledgerId: auth.uid, transactionId: lookup.sortKey });
-          else if (trip && journal.tripId === trip.id)
-            keys.push({ ledgerId: `TRIP#${trip.id}`, transactionId: journal.sortKey });
-        }
-        const rows = await this.repo.many("transactions", keys);
-        for (const row of rows) if (!row.deleted && duplicateScopes({ ...row.data, duplicateParticipantIds: journalById.get(row.id)?.duplicateParticipantIds }).includes(scope)) return {
-          id: row.data.id, title: row.data.title, amount: row.data.amount,
-          date: row.data.date, paidBy: alias(row.data.paidBy, auth.uid),
-          tripId: row.data.tripId,
-          splits: (row.data.splits || []).map(split => ({ ...split, friendId: alias(split.friendId, auth.uid) })),
-        };
-        cursor = page.cursor;
-      } while (cursor);
-    }
-  }
-  async maintainDuplicateIndex(work, data, previousKeys = []) {
-    const keys = duplicateScopes(data).map(scope => duplicateEntryKey(scope, data.id));
-    for (const key of previousKeys) if (!keys.some(next => keyOf("ledger", next) === keyOf("ledger", key))) {
-      work.delete("ledger", key);
-      const lockKey = ledgerKey(key.ledgerId);
-      work.rowChanged(await work.get("ledger", lockKey) || { ...lockKey, revision: 0 });
-    }
-    for (const key of keys) {
-      work.put("ledger", { ...key, id: data.id });
-      const lockKey = ledgerKey(key.ledgerId);
-      work.rowChanged(await work.get("ledger", lockKey) || { ...lockKey, revision: 0 });
-    }
-    return keys;
-  }
-  async removeDuplicateIndex(work, keys = []) {
-    for (const key of keys) {
-      work.delete("ledger", key);
-      const lockKey = ledgerKey(key.ledgerId);
-      work.rowChanged(await work.get("ledger", lockKey) || { ...lockKey, revision: 0 });
-    }
+  // Old journals may still reference retired content-matching index rows.
+  // Delete only their stored pointers; new writes never query or rebuild them.
+  removeLegacyDuplicateIndex(work, keys = []) {
+    for (const key of keys) if (typeof key?.ledgerId === "string" && key.ledgerId.startsWith("DUPLICATE#") && typeof key.recordId === "string" && key.recordId.startsWith("TX#")) work.delete("ledger", key);
   }
   async transaction(auth, requestId, input, options = {}) {
     const id = options.id || `tx-${crypto.createHash("sha256").update(`${auth.uid}:${requestId}`).digest("hex").slice(0, 32)}`,
       createdAt = new Date().toISOString();
     const mutationInput = { operation: options.replace ? "editTransaction" : "transaction", id: options.id, input: options.hashInput || input };
+    // duplicateCheck is accepted only for serialized drafts from older clients.
+    // It no longer enables matching; exact request identity remains authoritative.
+    const durableRetry = !options.replace && (input.durableRetry === true || input.duplicateCheck === true);
     return this.mutation(
       auth,
       requestId,
@@ -1163,16 +1071,6 @@ export class SplitTrackService {
         }
         const participantProfiles = await Promise.all(participants.map(participant => work.profile(participant.uid)));
         ensure(participantProfiles.every(profile => profile?.username), "Every participant needs a registered profile.");
-        const duplicateParticipantIds = participants.map(participant => participant.uid);
-        if (input.duplicateCheck === true && input.confirmDuplicate !== true) {
-          await this.backfillDuplicateIndex(auth.uid, `TX#${String(ownerState.generation || 0).padStart(6, "0")}#`, ledgerKey(auth.uid, `DUPLICATE_INDEX#${ownerState.generation || 0}`));
-          if (trip) await this.backfillDuplicateIndex(`TRIP#${trip.id}`, "TX#", ledgerKey(`TRIP#${trip.id}`, "DUPLICATE_INDEX"));
-          const duplicate = await this.duplicateCandidate(work, auth, duplicateScopes({
-            type, amount: amount(signedAmount), paidBy: payer, creatorId: auth.uid,
-            tripId: trip?.id, splits: type === "expense" ? participants.map(participant => ({ friendId: participant.uid })) : [],
-          }), trip, options.replace ? id : undefined);
-          if (duplicate) throw new ApiError(409, "A transaction with the same amount, payer and group or split members already exists. Continue to save another, or cancel.", "DUPLICATE_TRANSACTION", { existingTransaction: duplicate });
-        }
         // Removed split participants keep a corrected history projection with
         // zero share, including any overpayment left by the original entry.
         if (previous) for (const uid of previous.participantIds) if (!participants.some(p => p.uid === uid)) participants.push({ uid, shareCents: 0, paidCents: 0 });
@@ -1314,9 +1212,9 @@ export class SplitTrackService {
           creatorId: auth.uid,
           sourceTransactionId: input.sourceTransactionId,
           toAccountId: type === "transfer" ? input.toAccountId : undefined,
-          ...(previous?.clientRequestId || (!options.replace && input.duplicateCheck === true) ? { clientRequestId: previous?.clientRequestId || requestId } : {}),
+          ...(previous?.clientRequestId || durableRetry ? { clientRequestId: previous?.clientRequestId || requestId } : {}),
         };
-        const duplicateKeys = await this.maintainDuplicateIndex(work, { ...base, duplicateParticipantIds }, previous?.duplicateKeys);
+        if (previous) this.removeLegacyDuplicateIndex(work, previous.duplicateKeys);
         const sortKeys = {};
         for (const participant of participants) {
           const data = {
@@ -1374,8 +1272,6 @@ export class SplitTrackService {
             tripId: trip?.id,
             tripSpendCents: trip ? total : 0,
             createdAt,
-            duplicateKeys,
-            duplicateParticipantIds,
             creationHash: previous?.creationHash || jsonHash(mutationInput),
             ...(base.clientRequestId ? { clientRequestId: base.clientRequestId } : {}),
           },
@@ -1383,7 +1279,7 @@ export class SplitTrackService {
         );
         return { id };
       },
-      { durable: !options.replace && input.duplicateCheck === true },
+      { durable: durableRetry },
     );
   }
   async settle(auth, requestId, body) {
@@ -1406,7 +1302,7 @@ export class SplitTrackService {
         const journal = await this.transactionJournal(work, auth, id);
         if (journal.deleted) return { id, deleted: true };
         await this.reverseTransaction(work, journal);
-        await this.removeDuplicateIndex(work, journal.duplicateKeys);
+        this.removeLegacyDuplicateIndex(work, journal.duplicateKeys);
         const deletedAt = new Date().toISOString();
         const expiresAt = Math.floor(Date.now() / 1000) + 7 * 86400;
         for (const uid of journal.participantIds) {
@@ -1439,7 +1335,6 @@ export class SplitTrackService {
     ensure(owner === auth.uid, "Only the transaction owner can edit, delete or restore it.", 403);
     // Older journals retain this association on their history projection.
     journal.sourceTransactionId ||= row?.data.sourceTransactionId;
-    journal.duplicateKeys ||= row?.data ? duplicateScopes(row.data).map(scope => duplicateEntryKey(scope, id)) : [];
     return journal;
   }
   async reverseTransaction(work, journal) {
@@ -1523,11 +1418,9 @@ export class SplitTrackService {
         const { deleted, deletedAt, expiresAt, ...active } = row; work.put("transactions", active);
       }
       delete journal.deleted; delete journal.deletedAt; delete journal.expiresAt;
-      for (const key of journal.duplicateKeys || []) {
-        work.put("ledger", { ...key, id });
-        const lockKey = ledgerKey(key.ledgerId);
-        work.rowChanged(await work.get("ledger", lockKey) || { ...lockKey, revision: 0 });
-      }
+      this.removeLegacyDuplicateIndex(work, journal.duplicateKeys);
+      delete journal.duplicateKeys;
+      delete journal.duplicateParticipantIds;
       work.rowChanged(journal); return { id, restored: true };
     });
   }
@@ -1828,7 +1721,7 @@ export class SplitTrackService {
               journal.flows = journal.flows.filter(flow => flow.creditor !== auth.uid && flow.debtor !== auth.uid);
               if (journal.participantIds.length) work.rowChanged(journal);
               else {
-                await this.removeDuplicateIndex(work, journal.duplicateKeys || duplicateScopes(row.data).map(scope => duplicateEntryKey(scope, id)));
+                this.removeLegacyDuplicateIndex(work, journal.duplicateKeys);
                 work.delete("ledger", ledgerKey(`JOURNAL#${id}`), { revision: journal.revision });
               }
             }
