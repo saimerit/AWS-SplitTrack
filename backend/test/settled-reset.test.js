@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SplitTrackService } from '../src/core/service.js';
+import { createHandler } from '../src/core/handler.js';
+import { ApiError } from '../src/core/errors.js';
 import { pairId } from '../src/core/money.js';
 import { MemoryRepository } from './support/memoryRepository.js';
 
@@ -21,6 +23,31 @@ async function setup() {
   return { app, repo };
 }
 const shared = (peer, amount = 100) => ({ title: 'Shared expense', amount: -amount, type: 'expense', paidBy: 'user', date: '2026-11-22', splits: [{ friendId: 'user', paidAmount: amount }, { friendId: peer.uid, paidAmount: 0 }] });
+
+test('HTTP reset parses its body, rejects unsafe modes, and preserves unpaid balances', async () => {
+  const { app, repo } = await setup();
+  await app.transaction(alice, request(), { title: 'Settled income', type: 'income', amount: 1 });
+  const unpaid = await app.transaction(alice, request(), shared(bob));
+  const handle = createHandler(app, async () => alice, repo);
+  const event = (body, method = 'POST', encoded = false) => ({
+    rawPath: method === 'DELETE' ? '/state' : '/state/erase', requestContext: { http: { method } },
+    headers: { 'idempotency-key': request() },
+    body: encoded ? Buffer.from(body).toString('base64') : body, isBase64Encoded: encoded,
+  });
+  assert.equal((await handle(event('{bad json'))).statusCode, 400);
+  assert.equal((await handle(event(JSON.stringify({ mode: 'all' })))).statusCode, 400);
+  assert.equal((await app.snapshot(alice.uid)).generation, 0);
+  const denied = createHandler(app, async () => { throw new ApiError(401, 'Sign in required.'); }, repo);
+  assert.equal((await denied(event('{}'))).statusCode, 401);
+  const result = await handle(event(JSON.stringify({ mode: 'settled-only' }), 'POST', true));
+  assert.equal(result.statusCode, 200);
+  const reset = JSON.parse(result.body);
+  assert.equal(reset.result.removedTransactions, 1);
+  assert.equal(reset.result.retainedTransactions, 1);
+  assert.equal(reset.state.transactions[0].id, unpaid.result.id);
+  assert.equal(reset.state.friends.find(peer => peer.id === bob.uid).netBalance, 50);
+  assert.equal((await handle(event('', 'DELETE'))).statusCode, 200);
+});
 
 test('reset removes settled history and keeps separate owing and owed members with exact claims', async () => {
   const { app, repo } = await setup();
