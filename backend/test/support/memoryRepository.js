@@ -41,8 +41,9 @@ export class MemoryRepository {
       .sort((a, b) => String(a[sort]).localeCompare(String(b[sort])));
     if (reverse) rows.reverse();
     if (cursor) {
-      const index = rows.findIndex((row) => row[sort] === cursor[sort]);
-      rows = rows.slice(index + 1);
+      rows = rows.filter(row => reverse
+        ? String(row[sort]).localeCompare(String(cursor[sort])) < 0
+        : String(row[sort]).localeCompare(String(cursor[sort])) > 0);
     }
     const items = rows.slice(0, limit),
       last = items.at(-1);

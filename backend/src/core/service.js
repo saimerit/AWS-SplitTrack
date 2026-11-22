@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { ApiError, ensure, requiredText, optionalText } from "./errors.js";
 import { emptyState } from "./defaults.js";
+import { resetSettledHistory } from "./settledReset.js";
 import {
   amount,
   cents,
@@ -1136,10 +1137,13 @@ export class SplitTrackService {
           work.stateChanged(participant.uid);
           effects[participant.uid] = effect;
         }
+        const debtSourceIds = new Set(previous?.debtSourceIds || []);
         for (const flow of flows) {
           if (type === "settlement") {
             const pair = await work.pair(flow.creditor, flow.debtor);
+            const before = pair.claims.map(claim => ({ ...claim }));
             applySettlementFlow(pair, flow, id, input.sourceTransactionId);
+            for (const claim of before) if (!pair.claims.some(next => next.id === claim.id && next.remainingCents === claim.remainingCents)) debtSourceIds.add(claim.id.startsWith('reversal#') ? claim.id.slice(9) : claim.id);
             work.rowChanged(pair);
             mutateNumber(await this.link(work, flow.creditor, flow.debtor), "netCents", flow.cents);
             mutateNumber(await this.link(work, flow.debtor, flow.creditor), "netCents", -flow.cents);
@@ -1263,6 +1267,7 @@ export class SplitTrackService {
             creatorId: auth.uid,
             payerId: payer,
             sourceTransactionId: input.sourceTransactionId,
+            debtSourceIds: [...debtSourceIds],
             type,
             sortKey,
             sortKeys,
@@ -1604,156 +1609,8 @@ export class SplitTrackService {
       points,
     };
   }
-  async erase(auth, requestId) {
-    ensure(typeof requestId === "string" && /^[A-Za-z0-9_-]{12,100}$/.test(requestId), "A valid idempotency-key is required.");
-    await this.bootstrap(auth);
-    const hash = jsonHash({ operation: "erase" });
-    const markerKey = ledgerKey(auth.uid, `REQUEST#${requestId}`);
-    const marker = await this.repo.get("ledger", markerKey);
-    if (marker) {
-      ensure(marker.hash === hash, "This request ID was already used for another operation.", 409, "IDEMPOTENCY_CONFLICT");
-      if (marker.result.erased || !marker.resetId) return { result: marker.result, state: await this.snapshot(auth.uid) };
-      const current = await this.repo.get("ledger", ledgerKey(auth.uid));
-      if (current?.resetting?.id !== marker.resetId) return { result: { erased: true, needsContinue: false }, state: await this.snapshot(auth.uid, current) };
-    }
-    // Commit the new generation first. Every normal write checks resetting in
-    // Work.commit, preventing an in-flight shared expense from restoring data.
-    // Each cleanup step is small, transactional and resumable after a timeout.
-    const step = async (callback) => {
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const work = new Work(this.repo, true);
-        const state = await work.state(auth.uid);
-        const result = await callback(work, state);
-        try { await work.commit(); return result; }
-        catch (error) {
-          if (!this.isConflict(error)) throw error;
-          if (attempt === 4) throw new ApiError(409, "Another device updated this ledger. Please retry.", "WRITE_CONFLICT");
-          await new Promise(resolve => setTimeout(resolve, 20 * 2 ** attempt));
-        }
-      }
-    };
-    await step(async (work, current) => {
-      if (await work.get("ledger", markerKey)) return;
-      if (!current.resetting) {
-        const cleared = emptyState(auth.uid);
-        cleared.revision = current.revision;
-        cleared.generation = (current.generation || 0) + 1;
-        cleared.settings = { ...current.settings, selectedAccountId: "", receivingAccountId: "" };
-        cleared.resetting = { id: requestId, peers: current.friends.map(friend => friend.id), trips: current.trips.map(trip => trip.id), stage: 0 };
-        work.states.set(auth.uid, cleared);
-        work.stateChanged(auth.uid);
-        await this.publishReceiving(work, auth.uid);
-      }
-      // Joining an in-progress reset also gets a durable marker. Replaying any
-      // joined request after completion must never erase the next ledger.
-      work.put("ledger", {
-        ...markerKey, revision: 1, hash,
-        resetId: work.states.get(auth.uid).resetting.id,
-        result: { erased: false, needsContinue: true },
-        expiresAt: Math.floor(Date.now() / 1000) + 7 * 86400,
-      }, { revision: 0 });
-    });
-    const deadline = Date.now() + 7000;
-    let finished = false;
-    do {
-      finished = await step(async (work, state) => {
-        const reset = state.resetting;
-        if (!reset) return true;
-        if (reset.purgingTrip) {
-          const id = reset.purgingTrip;
-          const page = await this.repo.query("transactions", "ledgerId", `TRIP#${id}`, { limit: 20 });
-          for (const row of page.items) {
-            const journal = row.id ? await work.get("ledger", ledgerKey(`JOURNAL#${row.id}`)) : null;
-            if (journal?.tripId === id) {
-              delete journal.tripId;
-              journal.tripSpendCents = 0;
-              work.rowChanged(journal);
-            }
-            work.delete("transactions", { ledgerId: `TRIP#${id}`, transactionId: row.transactionId });
-          }
-          if (!page.items.length) {
-            const trip = await work.get("ledger", ledgerKey(`TRIP#${id}`));
-            if (trip) work.delete("ledger", ledgerKey(`TRIP#${id}`), { revision: trip.revision });
-            delete reset.purgingTrip;
-          }
-        } else if (reset.peers.length) {
-          const peerId = reset.peers[0];
-          const peer = await work.state(peerId);
-          const relationship = peer.friends.find(friend => friend.id === auth.uid);
-          if (relationship && relationship.netCents !== 0) {
-            relationship.netCents = 0;
-            work.stateChanged(peerId);
-          }
-          const pair = await work.get("ledger", ledgerKey(pairId(auth.uid, peerId)));
-          if (pair) { pair.claims = []; work.rowChanged(pair); }
-          reset.peers.shift();
-        } else if (reset.trips.length) {
-          const id = reset.trips[0];
-          const trip = await work.get("ledger", ledgerKey(`TRIP#${id}`));
-          if (trip) {
-            const previousMembers = [...trip.members];
-            if (trip.ownerId === auth.uid) { trip.deleted = true; reset.purgingTrip = id; }
-            trip.members = trip.members.filter(member => member !== auth.uid);
-            for (const member of previousMembers) {
-              if (member === auth.uid) continue;
-              const peer = await work.state(member);
-              peer.trips = peer.trips.filter(item => item.id !== id);
-              if (!trip.deleted && trip.members.includes(member)) peer.trips.push(structuredClone(trip));
-              work.stateChanged(member);
-            }
-            work.rowChanged(trip);
-          }
-          reset.trips.shift();
-        } else if (reset.stage === 0) {
-          const page = await this.repo.ownedTrips(auth.uid, { cursor: reset.tripCursor });
-          reset.trips = page.items.map(trip => trip.id || trip.ledgerId.slice(5));
-          if (page.cursor) reset.tripCursor = page.cursor;
-          else { delete reset.tripCursor; reset.stage++; }
-        } else if (reset.stage === 1) {
-          const page = await this.repo.query("transactions", "ledgerId", auth.uid, { prefix: "TX#", limit: 12 });
-          for (const row of page.items) {
-            const id = row.id || row.data?.id;
-            const journal = id ? await work.get("ledger", ledgerKey(`JOURNAL#${id}`)) : null;
-            if (journal) {
-              journal.participantIds = journal.participantIds.filter(uid => uid !== auth.uid);
-              delete journal.effects[auth.uid];
-              delete journal.sortKeys[auth.uid];
-              journal.flows = journal.flows.filter(flow => flow.creditor !== auth.uid && flow.debtor !== auth.uid);
-              if (journal.participantIds.length) work.rowChanged(journal);
-              else {
-                this.removeLegacyDuplicateIndex(work, journal.duplicateKeys);
-                work.delete("ledger", ledgerKey(`JOURNAL#${id}`), { revision: journal.revision });
-              }
-            }
-            work.delete("transactions", { ledgerId: auth.uid, transactionId: row.transactionId });
-            if (id) work.delete("data", { userId: auth.uid, recordId: `TX#${id}` });
-          }
-          if (!page.items.length) reset.stage++;
-        } else if (reset.stage <= 7) {
-          const table = ["ledger", "ledger", "data", "recurring", "templates", "ledger"][reset.stage - 2];
-          const partition = table === "data" ? "userId" : "ledgerId";
-          const value = reset.stage === 2 ? `ANALYTICS#${auth.uid}` : auth.uid;
-          const page = await this.repo.query(table, partition, value, { ...(table === "ledger" ? { prefix: reset.stage === 7 ? "BIN#" : "DAY#" } : table === "data" ? { prefix: "TX#" } : {}), limit: 80 });
-          for (const row of page.items) {
-            const sortKey = { ledger: "recordId", data: "recordId", recurring: "recurringId", templates: "templateId" }[table];
-            work.delete(table, { [partition]: value, [sortKey]: row[sortKey] });
-          }
-          if (!page.items.length) reset.stage++;
-        } else {
-          delete state.resetting;
-          const result = { erased: true, needsContinue: false };
-          const expiresAt = Math.floor(Date.now() / 1000) + 7 * 86400;
-          for (const id of new Set([requestId, reset.id])) {
-            work.put("ledger", { ...ledgerKey(auth.uid, `REQUEST#${id}`), revision: 1, hash, result, expiresAt });
-          }
-          work.stateChanged(auth.uid);
-          return true;
-        }
-        work.stateChanged(auth.uid);
-        return false;
-      });
-    } while (!finished && Date.now() < deadline);
-    return { result: { erased: finished, needsContinue: !finished }, state: await this.snapshot(auth.uid) };
+  async erase(auth, requestId, body = {}) {
+    return resetSettledHistory(this, Work, auth, requestId, body);
   }
   nextDue(value, frequency) {
     const date = new Date(value);
@@ -1896,7 +1753,7 @@ export class SplitTrackService {
         prefix: tripId ? "TX#" : `TX#${String(generation).padStart(6, "0")}#`,
         cursor: nextCursor, limit: wanted - rows.length, reverse: true,
       });
-      rows.push(...page.items.filter(row => !row.deleted));
+      rows.push(...page.items.filter(row => !row.deleted && !row.clearedFor?.includes(uid)));
       nextCursor = page.cursor;
       if (rows.length >= wanted || !nextCursor) break;
     }
@@ -1996,6 +1853,7 @@ export class SplitTrackService {
       revision: state.revision,
       generation: state.generation || 0,
       ledgerResetId: state.resetting?.id || null,
+      resetPolicy: "settled-only",
       accounts,
       friends,
       trips,

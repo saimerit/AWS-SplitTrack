@@ -259,7 +259,7 @@ test("fresh start deletes private history and keeps unrelated financial data unc
   });
   await app.erase(alice, request());
   const after = await app.snapshot(alice.uid);
-  assert.equal(after.accounts.length, 0);
+  assert.equal(after.accounts.length, 1);
   assert.equal(after.transactions.length, 0);
   assert.equal(after.summary.totalIncome, 0);
   await assert.rejects(
@@ -270,40 +270,44 @@ test("fresh start deletes private history and keeps unrelated financial data unc
     await repo.get("ledger", { ledgerId: bob.uid, recordId: "STATE" }),
     before,
   );
-  assert.equal((await app.snapshot(bob.uid)).friends[0].upiId, undefined);
+  assert.equal((await app.snapshot(bob.uid)).friends[0].upiId, 'alex_lee@okaxis');
   assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 0);
   assert.equal(await repo.get("data", { userId: alice.uid, recordId: `TX#${tx.result.id}` }), undefined);
   assert.equal(await repo.get("ledger", { ledgerId: `JOURNAL#${tx.result.id}`, recordId: "STATE" }), undefined);
 });
 
-test("fresh ledger removes unsettled splits and trips without blocking or replaying", async () => {
+test("fresh ledger keeps unpaid splits, payment provenance, profiles and trips", async () => {
   const { repo, app } = await setup();
   await app.settings(alice, request(), { selectionStyle: "dropdown", themeMode: "light" });
   await app.saveEntity(alice, request(), "trips", "fresh-trip", { name: "Test trip", startDate: "2026-11-18", members: ["user", bob.uid], coverGradient: ["#123456", "#654321"] });
   const tx = await app.transaction(alice, request(), { ...expense, tripId: "fresh-trip" });
   await app.settle(alice, request(), { friendId: bob.uid, amount: 10 });
+  const outstanding = (await repo.get("ledger", { ledgerId: pairId(alice.uid, bob.uid), recordId: "STATE" })).claims;
   await app.saveEntity(alice, request(), "templates", "old-template", { name: "Saved expense", amount: 10, transactionType: "expense" });
   const id = request();
   const reset = await app.erase(alice, id);
   assert.equal(reset.result.erased, true);
   assert.equal(reset.result.needsContinue, false);
-  assert.deepEqual(reset.state.transactions, []);
-  assert.deepEqual(reset.state.friends, []);
-  assert.deepEqual(reset.state.trips, []);
+  assert.equal(reset.state.transactions.length, 2);
+  assert.ok(reset.state.transactions.some(row => row.id === tx.result.id));
+  assert.equal(reset.state.friends.length, 1);
+  assert.equal(reset.state.trips.length, 1);
+  assert.equal(reset.state.accounts.length, 1);
+  assert.equal(balance(reset.state, bob.uid), 25.15);
   assert.equal(reset.state.settings.selectionStyle, "dropdown");
   assert.equal(reset.state.settings.themeMode, "light");
-  assert.equal((await app.snapshot(bob.uid)).friends[0].netBalance, 0);
-  assert.deepEqual((await app.snapshot(bob.uid)).trips, []);
-  assert.deepEqual((await repo.get("ledger", { ledgerId: pairId(alice.uid, bob.uid), recordId: "STATE" })).claims, []);
+  assert.equal((await app.snapshot(bob.uid)).friends[0].netBalance, -25.15);
+  assert.equal((await app.snapshot(bob.uid)).trips.length, 1);
+  assert.deepEqual((await repo.get("ledger", { ledgerId: pairId(alice.uid, bob.uid), recordId: "STATE" })).claims, outstanding);
   assert.equal((await app.records(alice, "templates")).items.length, 0);
-  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 0);
+  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 2);
   assert.equal((await repo.query("ledger", "ledgerId", alice.uid, { prefix: "DAY#" })).items.length, 0);
-  assert.equal((await repo.get("ledger", { ledgerId: `JOURNAL#${tx.result.id}`, recordId: "STATE" })).participantIds.includes(alice.uid), false);
+  assert.equal((await repo.get("ledger", { ledgerId: `JOURNAL#${tx.result.id}`, recordId: "STATE" })).participantIds.includes(alice.uid), true);
   const repeated = await app.erase(alice, id);
   assert.equal(repeated.state.generation, reset.state.generation);
   assert.deepEqual(repeated.result, reset.result);
   const next = await app.saveEntity(alice, request(), "accounts", "new-upi", { title: "Fresh UPI", kind: "upi", upiId: "new@okaxis" });
-  assert.equal(next.state.accounts.length, 1);
+  assert.equal(next.state.accounts.length, 2);
 });
 
 test("interrupted ledger cleanup resumes and rejects concurrent shared writes", async () => {
@@ -320,7 +324,7 @@ test("interrupted ledger cleanup resumes and rejects concurrent shared writes", 
   const resumed = await app.erase(alice, id);
   assert.equal(resumed.result.erased, true);
   assert.equal(resumed.state.generation, 1);
-  assert.equal(balance(await app.snapshot(bob.uid), alice.uid), 0);
+  assert.equal(balance(await app.snapshot(bob.uid), alice.uid), -35.15);
 });
 
 test("sync skips unchanged snapshots and includes both sides of a new split", async () => {
@@ -338,7 +342,7 @@ test("sync skips unchanged snapshots and includes both sides of a new split", as
   await assert.rejects(app.settings(alice, request(), { selectionStyle: "other" }), /selection style/);
 });
 
-test("fresh ledger physically deletes paginated analytics, private journals and archived trip records", async () => {
+test("fresh ledger clears paginated private history while preserving unpaid archived-trip entries", async () => {
   const { repo, app } = await setup();
   const ids = [];
   for (let index = 0; index < 125; index++) {
@@ -352,18 +356,18 @@ test("fresh ledger physically deletes paginated analytics, private journals and 
   assert.equal((await app.snapshot(alice.uid)).trips.length, 0);
   await app.erase(alice, request());
   for (const id of ids) assert.equal(await repo.get("ledger", { ledgerId: `JOURNAL#${id}`, recordId: "STATE" }), undefined);
-  assert.equal((await repo.query("ledger", "ledgerId", `ANALYTICS#${alice.uid}`, { prefix: "DAY#" })).items.length, 0);
-  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 0);
-  assert.equal((await repo.query("data", "userId", alice.uid, { prefix: "TX#" })).items.length, 0);
-  assert.equal(await repo.get("ledger", { ledgerId: "TRIP#archived-reset-trip", recordId: "STATE" }), undefined);
-  assert.equal((await repo.query("transactions", "ledgerId", "TRIP#archived-reset-trip")).items.length, 0);
-  // The peer can still remove their shared entry after its old trip was purged.
+  assert.equal((await repo.query("ledger", "ledgerId", `ANALYTICS#${alice.uid}`, { prefix: "DAY#" })).items.length, 1);
+  assert.equal((await repo.query("transactions", "ledgerId", alice.uid)).items.length, 1);
+  assert.equal((await repo.query("data", "userId", alice.uid, { prefix: "TX#" })).items.length, 1);
+  assert.equal((await repo.get("ledger", { ledgerId: "TRIP#archived-reset-trip", recordId: "STATE" })).deleted, true);
+  assert.equal((await repo.query("transactions", "ledgerId", "TRIP#archived-reset-trip")).items.length, 1);
+  // Regular Delete remains available and reverses the preserved debt correctly.
   await app.deleteTransaction(bob, request(), shared.result.id);
   assert.equal((await app.snapshot(bob.uid)).summary.totalExpenses, 0);
   assert.equal(balance(await app.snapshot(bob.uid), alice.uid), 0);
 });
 
-test("resetting a joined trip preserves other members and old reversals cannot revive erased debts", async () => {
+test("resetting a joined trip preserves membership and unpaid reversals remain exact", async () => {
   const { app, repo } = await setup();
   const charlie = { uid: "charlieTestUid", email: "charlie@example.invalid", name: "Charlie" };
   await app.bootstrap(charlie);
@@ -372,7 +376,7 @@ test("resetting a joined trip preserves other members and old reversals cannot r
   const shared = await app.transaction(bob, request(), { ...expense, tripId: "joined-reset-trip", splits: [{ friendId: "user", paidAmount: 70.3 }, { friendId: alice.uid, paidAmount: 0 }] });
   await app.erase(alice, request());
   const trip = await repo.get("ledger", { ledgerId: "TRIP#joined-reset-trip", recordId: "STATE" });
-  assert.deepEqual(trip.members.sort(), [bob.uid, charlie.uid].sort());
+  assert.deepEqual(trip.members.sort(), [alice.uid, bob.uid, charlie.uid].sort());
   assert.equal((await app.snapshot(bob.uid)).trips.length, 1);
   assert.equal((await app.snapshot(charlie.uid)).trips.length, 1);
   await app.saveEntity(alice, request(), "accounts", "after-reset", { title: "New UPI", kind: "upi", upiId: "fresh@okaxis" });
@@ -393,8 +397,10 @@ test("overlapping and repeated fresh-ledger requests finish once per generation"
   assert.ok(results.every(result => result.result.erased));
   assert.equal((await app.snapshot(alice.uid)).generation, 1);
   assert.equal((await app.snapshot(bob.uid)).generation, 1);
-  assert.deepEqual((await app.snapshot(alice.uid)).transactions, []);
-  assert.deepEqual((await app.snapshot(bob.uid)).transactions, []);
+  assert.equal((await app.snapshot(alice.uid)).transactions.length, 1);
+  assert.equal((await app.snapshot(bob.uid)).transactions.length, 1);
+  assert.equal(balance(await app.snapshot(alice.uid), bob.uid), 35.15);
+  assert.equal(balance(await app.snapshot(bob.uid), alice.uid), -35.15);
   assert.equal((await app.erase(alice, keys[0])).state.generation, 1);
 });
 

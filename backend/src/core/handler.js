@@ -152,7 +152,7 @@ export function createHandler(
         (path === "/state/erase" && method === "POST") ||
         (path === "/state" && method === "DELETE")
       )
-        return response(await app.erase(auth, requestId));
+        return response(await app.erase(auth, requestId, body));
       if (path === "/state" && ["POST", "PUT"].includes(method))
         throw new ApiError(
           405,
