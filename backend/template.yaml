@@ -30,6 +30,7 @@ Globals:
         FIREBASE_PROJECT_ID: !Ref FirebaseProjectId
         MEDIA_BUCKET: !Ref MediaBucketName
         CORS_ORIGIN: '*'
+        ADOPTION_TABLE: SplitTrackAppReleases
 
 Resources:
   SplitTrackHttpApi:
@@ -43,6 +44,7 @@ Resources:
           - x-admin-key
           - authorization
           - idempotency-key
+          - x-app-version
         AllowMethods:
           - GET
           - POST
@@ -253,6 +255,12 @@ Resources:
       CodeUri: .build/
       Handler: handlers/state.handler
       Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/SplitTrackAppReleases'
         - DynamoDBCrudPolicy:
             TableName: !Ref SplitTrackDataTable
         - DynamoDBCrudPolicy:

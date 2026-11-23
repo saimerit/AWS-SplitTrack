@@ -5,6 +5,7 @@ import { repository } from "./awsRepository.js";
 import { SplitTrackService } from "./service.js";
 import { MediaService } from "./media.js";
 import { extractStatementPdf } from "./statementPdf.js";
+import { recordAdoption } from "./adoption.js";
 
 const media = new MediaService(),
   service = new SplitTrackService(repository, media);
@@ -12,7 +13,7 @@ const headers = {
   "content-type": "application/json",
   "access-control-allow-origin": process.env.CORS_ORIGIN || "*",
   "access-control-allow-headers":
-    "content-type,authorization,idempotency-key,x-admin-key",
+    "content-type,authorization,idempotency-key,x-admin-key,x-app-version",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
   "cache-control": "no-store",
 };
@@ -119,6 +120,8 @@ export function createHandler(
       }
       const auth = await verifyAuth(event),
         requestId = header(event, "idempotency-key");
+      if (method === "GET" && path === "/state")
+        await recordAdoption(auth.uid, header(event, "x-app-version"));
       if (path === "/api/import/statement/pdf" && method === "POST")
         return response(await extractStatementPdf(parse(event).base64));
       if (["/auth/signup", "/auth/signin", "/auth/google"].includes(path))
