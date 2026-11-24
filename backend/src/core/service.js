@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { ApiError, ensure, requiredText, optionalText } from "./errors.js";
 import { emptyState } from "./defaults.js";
 import { resetSettledHistory } from "./settledReset.js";
+import { measure } from "./performance.js";
 import {
   amount,
   cents,
@@ -201,8 +202,8 @@ export class SplitTrackService {
     for (let attempt = 0; attempt < 5; attempt++) {
       const existing = await this.repo.get("data", profileKey(auth.uid));
       if (existing) return existing;
-      const work = new Work(this.repo),
-        state = await work.state(auth.uid);
+      const work = new Work(this.repo);
+      await work.state(auth.uid);
       const profile = {
         ...profileKey(auth.uid),
         uid: auth.uid,
@@ -232,17 +233,24 @@ export class SplitTrackService {
       "TransactionConflictException",
     ].includes(error.name);
   }
-  async mutation(auth, requestId, input, callback, { durable = false } = {}) {
+  async mutation(auth, requestId, input, callback, { durable = false, includeSnapshot = true } = {}) {
     ensure(
       typeof requestId === "string" &&
         /^[A-Za-z0-9_-]{12,100}$/.test(requestId),
       "A valid idempotency-key is required.",
     );
-    await this.bootstrap(auth);
+    const profile = await this.bootstrap(auth);
+    // A profile change also advances STATE. Do not reuse a profile read that
+    // preceded the revision we will conditionally commit against.
+    this.repo.forget?.("data", profileKey(auth.uid));
     const markerKey = ledgerKey(auth.uid, `REQUEST#${requestId}`),
       hash = jsonHash(input);
     for (let attempt = 0; attempt < 5; attempt++) {
-      const marker = await this.repo.get("ledger", markerKey);
+      const work = new Work(this.repo);
+      const [marker] = await Promise.all([
+        work.get("ledger", markerKey),
+        work.state(auth.uid),
+      ]);
       if (marker) {
         ensure(
           marker.hash === hash,
@@ -250,10 +258,12 @@ export class SplitTrackService {
           409,
           "IDEMPOTENCY_CONFLICT",
         );
+        if (!includeSnapshot) return { result: marker.result };
+        // The parallel state read can precede another device's commit. Read
+        // again after observing its marker so a retry returns committed state.
+        this.repo.invalidate?.();
         return { result: marker.result, state: await this.snapshot(auth.uid) };
       }
-      const work = new Work(this.repo);
-      await work.state(auth.uid);
       try {
         const result = await callback(work);
         work.put(
@@ -268,7 +278,14 @@ export class SplitTrackService {
           { revision: 0 },
         );
         await work.commit();
-        return { result, state: await this.snapshot(auth.uid, work.states.get(auth.uid)) };
+        if (!includeSnapshot) return { result };
+        const updatedProfile =
+          work.actions.get(`data:${keyOf("data", profile)}`)?.item ??
+          await work.profile(auth.uid);
+        return {
+          result,
+          state: await this.snapshot(auth.uid, work.states.get(auth.uid), updatedProfile),
+        };
       } catch (error) {
         if (!this.isConflict(error)) throw error;
         if (attempt === 4)
@@ -291,17 +308,17 @@ export class SplitTrackService {
     };
   }
   async profile(auth) {
-    const profile = await this.bootstrap(auth);
+    const [profile, state] = await Promise.all([
+      this.bootstrap(auth),
+      this.repo.get("ledger", ledgerKey(auth.uid)),
+    ]);
     return {
       ...(await this.publicProfile(profile)),
       ...receivingProfileFields(profile),
       email: profile.email,
       username: profile.username,
       displayName: profile.name,
-      settings: (
-        (await this.repo.get("ledger", ledgerKey(auth.uid))) ||
-        emptyState(auth.uid)
-      ).settings,
+      settings: (state || emptyState(auth.uid)).settings,
     };
   }
   async usernameAvailable(value, uid) {
@@ -1284,7 +1301,7 @@ export class SplitTrackService {
         );
         return { id };
       },
-      { durable: durableRetry },
+      { durable: durableRetry, includeSnapshot: options.includeSnapshot !== false },
     );
   }
   async settle(auth, requestId, body) {
@@ -1440,14 +1457,12 @@ export class SplitTrackService {
     return { items: rows.map(row => ({ ...row.data, paidBy: alias(row.data.paidBy, auth.uid), splits: (row.data.splits || []).map(s => ({ ...s, friendId: alias(s.friendId, auth.uid) })), deletedAt: row.deletedAt, expiresAt: row.expiresAt, canRestore: row.ownerId === auth.uid })) };
   }
   async getTransaction(auth, id) {
-    const lookup = await this.repo.get("data", {
-      userId: auth.uid,
-      recordId: `TX#${id}`,
-    });
+    const [lookup, stored] = await Promise.all([
+      this.repo.get("data", { userId: auth.uid, recordId: `TX#${id}` }),
+      this.repo.get("ledger", ledgerKey(auth.uid)),
+    ]);
     ensure(lookup, "Transaction not found.", 404);
-    const state =
-      (await this.repo.get("ledger", ledgerKey(auth.uid))) ||
-      emptyState(auth.uid);
+    const state = stored || emptyState(auth.uid);
     const row = await this.repo.get("transactions", {
       ledgerId: auth.uid,
       transactionId: lookup.sortKey,
@@ -1794,10 +1809,20 @@ export class SplitTrackService {
     }
     return { changed: true, state: await this.snapshot(uid, state) };
   }
-  async snapshot(uid, stored) {
+  async initialState(auth) {
+    // Read the revision before its profile. A concurrent profile update can
+    // then advance the revision, which the next incremental sync will see.
+    const state = await this.repo.get("ledger", ledgerKey(auth.uid));
+    const profile = await this.bootstrap(auth);
+    return this.snapshot(auth.uid, state, profile);
+  }
+  snapshot(uid, stored, knownProfile) {
+    return measure("snapshot", () => this.buildSnapshot(uid, stored, knownProfile));
+  }
+  async buildSnapshot(uid, stored, knownProfile) {
     const state = stored || (await this.repo.get("ledger", ledgerKey(uid))) || emptyState(uid);
     const [profile, page, profiles] = await Promise.all([
-      this.repo.get("data", profileKey(uid)),
+      knownProfile ?? this.repo.get("data", profileKey(uid)),
       this.history(uid, { generation: state.generation || 0 }),
       this.repo.many(
         "data",

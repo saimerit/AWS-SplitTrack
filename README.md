@@ -12,7 +12,7 @@ The local `Access/` folder, numbered Firebase registrations, service-account fil
 | --- | --- |
 | Region and stack | `ap-south-1`, `splittrack-backend` |
 | HTTP API | `e3kt7e3dag`, [API base URL](https://e3kt7e3dag.execute-api.ap-south-1.amazonaws.com) |
-| Lambdas | Existing API, Auth, State, Health and Changelog functions; Node.js 22, arm64, 256 MB, 15 seconds |
+| Lambdas | Node.js 22, arm64, 15 seconds; API/Auth/State 1,024 MB, Changelog 512 MB, Health 256 MB; API/State use `live` aliases |
 | DynamoDB | `SplitTrackData`, `SplitTrackLedgerData`, `SplitTrackTransactions`, `SplitTrackRecurring`, `SplitTrackTemplates`, `SplitTrackChangelog` |
 | Private S3 bucket | `splittrack-deployments-726016642280-ap-south-1`; app images use `app-media/{firebaseUid}/` and expiring signed URLs |
 | Admin authentication | Existing SSM `/splittrack/admin-api-key`; never include it in the mobile app |
@@ -43,7 +43,9 @@ Cleanup commits in bounded transactions and returns `result.needsContinue` when 
 
 ## Validate and deploy
 
-The latest backend bundle was deployed on **23 November 2026 (IST)** through reviewed change set `reset-route-fix-20261122`; `splittrack-backend` reached `UPDATE_COMPLETE`. The reset endpoint now parses the request body before invoking settled-history cleanup, fixing the `ReferenceError` that returned HTTP 500. All five existing Lambda code hashes match the validated bundle. The same 44 resources and API definitions remain; only Lambda code changed. The 60 non-PDF backend tests passed, the five PDF tests passed when run separately, and the bundle build and packaged reset endpoint passed. Deployment evidence is in ignored `backend/.deployment/reset-route-fix-20261122/deployment-report.json`. Live health and unauthenticated state/reset route guards passed without creating or clearing user records. Authenticated real-user reset and native device flows remain to be checked from the app; see [mobile build steps](https://github.com/AdityaRoy999/splitrack/blob/main/docs/mobile-builds.md).
+The **24 November 2026** performance update deployed through `backend-latency-20261124` and `backend-latency-final-20261124`, both reaching `UPDATE_COMPLETE`. It increases measured CPU allocation, reduces the shared bundle, reuses reads within requests, preserves concurrent profile/retry behavior, and avoids repeated batch-import snapshots. API and State now use versioned `live` aliases. A seven-day API access log records gateway/integration timings without request payloads. Warm autoscaling is configured in the template but disabled at current usage and while AWS processes the regional concurrency increase. See [performance measurements, recurring costs and the growth plan](backend/docs/PERFORMANCE.md).
+
+The preceding reset fix was deployed on **23 November 2026 (IST)** through reviewed change set `reset-route-fix-20261122`. It parses the reset body before invoking settled-history cleanup, fixing the `ReferenceError` that returned HTTP 500. That fix remains in the current bundle. Authenticated real-user reset and native device flows remain to be checked from the app; see [mobile build steps](https://github.com/AdityaRoy999/splitrack/blob/main/docs/mobile-builds.md).
 
 From `backend/`, run `npm ci` and `npm run validate`. Validation runs financial, concurrency, privacy and Firebase-token tests, then builds one ESM bundle with five small Lambda entry files in ignored `.build/`. The duplicate reference servers and custom password/JWT implementation were retired. See [FRONTEND_BACKEND_MAPPING.md](FRONTEND_BACKEND_MAPPING.md) for the API contract.
 
@@ -56,11 +58,13 @@ aws cloudformation validate-template --template-body file://.deployment/packaged
 aws cloudformation create-change-set --stack-name splittrack-backend --change-set-name REVIEWED_CHANGE_NAME --change-set-type UPDATE --template-body file://.deployment/packaged.yaml --parameters file://.deployment/parameters.json --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND --region ap-south-1
 ```
 
-Create the ignored parameter file locally with `FirebaseProjectId` and `MediaBucketName`, preserving deployed values on later updates. Inspect `describe-change-set` before execution: all actions must modify existing resources without replacement. Under the current deployment constraints, do not execute additions, deletions or replacements. Confirm `UPDATE_COMPLETE`, health, authenticated requests and cross-user isolation afterward.
+Create the ignored parameter file locally with `FirebaseProjectId` and `MediaBucketName`, preserving deployed parameter values on later updates. The performance template also has `InteractiveMemorySize`, `EnableWarmConcurrency`, `WarmMinConcurrency` and `WarmMaxConcurrency`. Inspect `describe-change-set` before execution. Ledger tables and the API identity must remain intact; review version/alias, invocation-permission and logging changes against the intended rollout. Confirm `UPDATE_COMPLETE`, health, authenticated requests and cross-user isolation afterward.
 
 The admin dashboard continues to read `/changelog` and publish `/admin/changelog` with `x-admin-key`. Changelog fields remain `version`, `message` and `notes`. Keep the admin key local and out of Git.
 
 ## Performance and limits
+
+The current configuration serves a small audience with request-driven Lambda and DynamoDB billing. It does not purchase capacity for 500,000 users. Optional, capped provisioned autoscaling can be enabled later through `node backend/scripts/configure-warm-capacity.mjs`; the command defaults to a quota/cost dry run. The existing reduced regional concurrency quota prevents activation today. Larger audiences also require changes to foreground polling, realistic load tests, quota increases and removal of maintenance/telemetry hot spots. See [PERFORMANCE.md](backend/docs/PERFORMANCE.md) before increasing capacity.
 
 Clients cache per-user snapshots and sync on startup, foregrounding and periodic refresh. Tab changes use loaded data. The server batches profile reads, paginates history, stores analytics aggregates and caches signing keys and signed image URLs inside warm Lambdas.
 

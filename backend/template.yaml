@@ -11,6 +11,31 @@ Parameters:
     Type: String
     Default: splittrack-deployments-726016642280-ap-south-1
     Description: Existing private bucket; app media uses only its app-media prefix
+  InteractiveMemorySize:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 1536, 1769, 2048]
+    Description: CPU allocation measured for API, state and profile request paths
+  EnableWarmConcurrency:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Enable capped provisioned capacity for live API/state aliases after checking regional quota and recurring cost
+  WarmMinConcurrency:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+    Description: Minimum ready environments per API/state alias when warm capacity is enabled
+  WarmMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 50000
+    Description: Maximum ready environments per alias; choose from measured traffic, quota and budget before increasing
+
+Conditions:
+  WarmConcurrencyEnabled: !Equals [!Ref EnableWarmConcurrency, 'true']
 
 Globals:
   Function:
@@ -33,9 +58,18 @@ Globals:
         ADOPTION_TABLE: SplitTrackAppReleases
 
 Resources:
+  HttpApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /splittrack/http-api/access
+      RetentionInDays: 7
+
   SplitTrackHttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiAccessLogs.Arn
+        Format: '{"event":"api_request","requestId":"$context.requestId","integrationRequestId":"$context.integration.requestId","route":"$context.routeKey","status":"$context.status","responseLatencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","responseBytes":"$context.responseLength"}'
       CorsConfiguration:
         AllowOrigins:
           - '*'
@@ -174,6 +208,13 @@ Resources:
     Properties:
       CodeUri: .build/
       Handler: handlers/api.handler
+      MemorySize: !Ref InteractiveMemorySize
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      ProvisionedConcurrencyConfig: !If
+        - WarmConcurrencyEnabled
+        - ProvisionedConcurrentExecutions: !Ref WarmMinConcurrency
+        - !Ref AWS::NoValue
       Environment:
         Variables:
           ADMIN_API_KEY: '{{resolve:ssm:/splittrack/admin-api-key}}'
@@ -254,6 +295,13 @@ Resources:
     Properties:
       CodeUri: .build/
       Handler: handlers/state.handler
+      MemorySize: !Ref InteractiveMemorySize
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      ProvisionedConcurrencyConfig: !If
+        - WarmConcurrencyEnabled
+        - ProvisionedConcurrentExecutions: !Ref WarmMinConcurrency
+        - !Ref AWS::NoValue
       Policies:
         - Statement:
             - Effect: Allow
@@ -364,6 +412,7 @@ Resources:
     Properties:
       CodeUri: .build/
       Handler: handlers/changelog.handler
+      MemorySize: 512
       Environment:
         Variables:
           ADMIN_API_KEY: '{{resolve:ssm:/splittrack/admin-api-key}}'
@@ -406,6 +455,7 @@ Resources:
     Properties:
       CodeUri: .build/
       Handler: handlers/auth.handler
+      MemorySize: !Ref InteractiveMemorySize
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SplitTrackDataTable
@@ -446,6 +496,56 @@ Resources:
             ApiId: !Ref SplitTrackHttpApi
             Path: /auth/me
             Method: GET
+
+  ApiWarmTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: WarmConcurrencyEnabled
+    DependsOn: ApiFunctionAliaslive
+    Properties:
+      MinCapacity: !Ref WarmMinConcurrency
+      MaxCapacity: !Ref WarmMaxConcurrency
+      ResourceId: !Sub function:${ApiFunction}:live
+      ScalableDimension: lambda:function:ProvisionedConcurrency
+      ServiceNamespace: lambda
+
+  StateWarmTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: WarmConcurrencyEnabled
+    DependsOn: StateFunctionAliaslive
+    Properties:
+      MinCapacity: !Ref WarmMinConcurrency
+      MaxCapacity: !Ref WarmMaxConcurrency
+      ResourceId: !Sub function:${StateFunction}:live
+      ScalableDimension: lambda:function:ProvisionedConcurrency
+      ServiceNamespace: lambda
+
+  ApiWarmPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: WarmConcurrencyEnabled
+    Properties:
+      PolicyName: splittrack-api-warm-utilization
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ApiWarmTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 0.7
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
+
+  StateWarmPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: WarmConcurrencyEnabled
+    Properties:
+      PolicyName: splittrack-state-warm-utilization
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref StateWarmTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 0.7
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
 
 Outputs:
   ApiUrl:

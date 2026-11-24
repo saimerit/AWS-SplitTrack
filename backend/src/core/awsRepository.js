@@ -1,4 +1,5 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { databaseCall, measure } from "./performance.js";
 import {
   DynamoDBDocumentClient,
   GetCommand,
@@ -26,13 +27,13 @@ export class AwsRepository {
   }
   async get(table, key) {
     return (
-      await this.client.send(
+      await databaseCall(() => this.client.send(
         new GetCommand({
           TableName: this.tables[table],
           Key: key,
           ConsistentRead: true,
         }),
-      )
+      ))
     ).Item;
   }
   async many(table, keys) {
@@ -49,9 +50,9 @@ export class AwsRepository {
       };
       let attempts = 0;
       while (Object.keys(requested).length) {
-        const response = await this.client.send(
+        const response = await databaseCall(() => this.client.send(
           new BatchGetCommand({ RequestItems: requested }),
-        );
+        ));
         result.push(...(response.Responses?.[this.tables[table]] || []));
         requested = response.UnprocessedKeys || {};
         if (Object.keys(requested).length) {
@@ -84,7 +85,7 @@ export class AwsRepository {
       values[":prefix"] = prefix;
       expression += " AND begins_with(#sk, :prefix)";
     }
-    const result = await this.client.send(
+    const result = await databaseCall(() => this.client.send(
       new QueryCommand({
         TableName: this.tables[table],
         KeyConditionExpression: expression,
@@ -95,11 +96,11 @@ export class AwsRepository {
         ScanIndexForward: !reverse,
         ConsistentRead: true,
       }),
-    );
+    ));
     return { items: result.Items || [], cursor: result.LastEvaluatedKey };
   }
   async transact(actions) {
-    await this.client.send(
+    await measure("commit", () => databaseCall(() => this.client.send(
       new TransactWriteCommand({
         TransactItems: actions.map((action) => {
           const table = this.tables[action.table];
@@ -133,25 +134,25 @@ export class AwsRepository {
           };
         }),
       }),
-    );
+    )));
   }
   async ownedTrips(uid, { cursor, limit = 80 } = {}) {
     // Reset-only discovery includes archived trips no longer in the active state.
     // This uses the existing ledger table and never scans transaction contents.
-    const result = await this.client.send(new ScanCommand({
+    const result = await databaseCall(() => this.client.send(new ScanCommand({
       TableName: this.tables.ledger,
       FilterExpression: "begins_with(#pk, :trip) AND #owner = :uid",
       ProjectionExpression: "#pk, #sk, #id",
       ExpressionAttributeNames: { "#pk": "ledgerId", "#sk": "recordId", "#id": "id", "#owner": "ownerId" },
       ExpressionAttributeValues: { ":trip": "TRIP#", ":uid": uid },
       ExclusiveStartKey: cursor, Limit: limit, ConsistentRead: true,
-    }));
+    })));
     return { items: result.Items || [], cursor: result.LastEvaluatedKey };
   }
   async releases() {
-    const result = await this.client.send(
+    const result = await databaseCall(() => this.client.send(
       new ScanCommand({ TableName: this.tables.changelog, Limit: 100 }),
-    );
+    ));
     return (result.Items || []).sort((a, b) =>
       String(b.publishedAt).localeCompare(String(a.publishedAt)),
     );
