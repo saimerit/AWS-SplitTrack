@@ -10,6 +10,8 @@ await build({
   entryPoints: [path.join(root, "src/core/handler.js")],
   outfile: path.join(out, "core.mjs"),
   bundle: true,
+  // Prefer the SDK's ESM exports so unused service commands can be removed.
+  mainFields: ["module", "main"],
   platform: "node",
   format: "esm",
   target: "node22",

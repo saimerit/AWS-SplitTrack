@@ -1,11 +1,14 @@
 import crypto from "node:crypto";
-import { authenticate } from "./firebaseAuth.js";
+import { performance } from "node:perf_hooks";
+import { authenticate, warmSigningKeys } from "./firebaseAuth.js";
 import { ApiError, ensure } from "./errors.js";
 import { repository } from "./awsRepository.js";
 import { SplitTrackService } from "./service.js";
 import { MediaService } from "./media.js";
 import { extractStatementPdf } from "./statementPdf.js";
 import { recordAdoption } from "./adoption.js";
+import { RequestRepository } from "./requestRepository.js";
+import { measure, recordTiming, withRequestTiming } from "./performance.js";
 
 const media = new MediaService(),
   service = new SplitTrackService(repository, media);
@@ -17,11 +20,12 @@ const headers = {
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
   "cache-control": "no-store",
 };
-export const response = (body, statusCode = 200) => ({
-  statusCode,
-  headers,
-  body: JSON.stringify(body),
-});
+export const response = (body, statusCode = 200) => {
+  const started = performance.now();
+  const result = { statusCode, headers, body: JSON.stringify(body) };
+  recordTiming("serialize", performance.now() - started);
+  return result;
+};
 const header = (event, name) =>
   Object.entries(event.headers || {}).find(
     ([key]) => key.toLowerCase() === name,
@@ -60,8 +64,12 @@ export function createHandler(
   app = service,
   verifyAuth = authenticate,
   repo = repository,
+  telemetry = recordAdoption,
 ) {
-  return async (event) => {
+  return withRequestTiming(async (event) => {
+    const scopedRepo = new RequestRepository(repo);
+    const scopedApp = app instanceof SplitTrackService ? new SplitTrackService(scopedRepo, app.media) : app;
+    let adoption;
     try {
       const method =
           event.requestContext?.http?.method || event.httpMethod || "GET",
@@ -118,10 +126,14 @@ export function createHandler(
         ]);
         return response({ published: true }, 201);
       }
-      const auth = await verifyAuth(event),
+      const auth = await measure("auth", () => verifyAuth(event)),
         requestId = header(event, "idempotency-key");
-      if (method === "GET" && path === "/state")
-        await recordAdoption(auth.uid, header(event, "x-app-version"));
+      adoption = method === "GET" && path === "/state"
+        ? measure("telemetry", () => telemetry(auth.uid, header(event, "x-app-version")))
+        : null;
+      // Telemetry shares the existing request lifetime, but runs alongside the
+      // state reads. Awaiting it prevents work being lost when Lambda freezes.
+      if (adoption) adoption.catch(() => {});
       if (path === "/api/import/statement/pdf" && method === "POST")
         return response(await extractStatementPdf(parse(event).base64));
       if (["/auth/signup", "/auth/signin", "/auth/google"].includes(path))
@@ -130,32 +142,33 @@ export function createHandler(
           "Sign in through Firebase Authentication in the app.",
         );
       if ((path === "/auth/me" || path === "/api/profile") && method === "GET")
-        return response(await app.profile(auth));
+        return response(await scopedApp.profile(auth));
       if (path === "/api/profile" && method === "PUT")
-        return response(await app.updateProfile(auth, requestId, parse(event)));
+        return response(await scopedApp.updateProfile(auth, requestId, parse(event)));
       if (path === "/api/users/username" && method === "GET")
-        return response(await app.usernameAvailable(query.value, auth.uid));
+        return response(await scopedApp.usernameAvailable(query.value, auth.uid));
       if (path === "/api/users/search" && method === "GET")
-        return response({ items: await app.search(query.q, auth.uid) });
+        return response({ items: await scopedApp.search(query.q, auth.uid) });
       if (path === "/api/media" && method === "POST")
         return response(
-          await app.media.upload(auth.uid, parse(event).data),
+          await scopedApp.media.upload(auth.uid, parse(event).data),
           201,
         );
       if (path === "/api/settings" && method === "PUT")
-        return response(await app.settings(auth, requestId, parse(event)));
+        return response(await scopedApp.settings(auth, requestId, parse(event)));
       if (path === "/api/analytics" && method === "GET")
-        return response(await app.analytics(auth, query));
+        return response(await scopedApp.analytics(auth, query));
       if (path === "/state" && method === "GET") {
-        if (query.after !== undefined) return response(await app.sync(auth.uid, query.after));
-        await app.bootstrap(auth);
-        return response(await app.snapshot(auth.uid));
+        let state;
+        if (query.after !== undefined) state = await scopedApp.sync(auth.uid, query.after);
+        else state = await scopedApp.initialState(auth);
+        return response(state);
       }
       if (
         (path === "/state/erase" && method === "POST") ||
         (path === "/state" && method === "DELETE")
       )
-        return response(await app.erase(auth, requestId, parse(event)));
+        return response(await scopedApp.erase(auth, requestId, parse(event)));
       if (path === "/state" && ["POST", "PUT"].includes(method))
         throw new ApiError(
           405,
@@ -166,7 +179,7 @@ export function createHandler(
         const [, type, id] = entity;
         if (method === "PUT")
           return response(
-            await app.saveEntity(
+            await scopedApp.saveEntity(
               auth,
               requestId,
               type,
@@ -176,7 +189,7 @@ export function createHandler(
           );
         if (method === "DELETE")
           return response(
-            await app.deleteEntity(
+            await scopedApp.deleteEntity(
               auth,
               requestId,
               type,
@@ -189,7 +202,7 @@ export function createHandler(
         method === "GET"
       )
         return response(
-          await app.history(auth.uid, {
+          await scopedApp.history(auth.uid, {
             cursor: query.cursor,
             limit: query.limit,
           }),
@@ -200,7 +213,7 @@ export function createHandler(
       ) {
         const body = parse(event);
         return response(
-          await app.transaction(auth, requestId, body.transaction || body),
+          await scopedApp.transaction(auth, requestId, body.transaction || body),
           201,
         );
       }
@@ -218,38 +231,39 @@ export function createHandler(
         );
         let importedCount = 0;
         for (const transaction of list) {
-          await app.transaction(
+          await scopedApp.transaction(
             auth,
             `${requestId}_${importedCount}`,
             transaction,
+            { includeSnapshot: false },
           );
           importedCount++;
         }
         return response(
-          { result: { importedCount }, state: await app.snapshot(auth.uid) },
+          { result: { importedCount }, state: await scopedApp.snapshot(auth.uid) },
           201,
         );
       }
-      if ((path === "/transactions/bin" || path === "/api/transactions/bin") && method === "GET") return response(await app.transactionBin(auth));
+      if ((path === "/transactions/bin" || path === "/api/transactions/bin") && method === "GET") return response(await scopedApp.transactionBin(auth));
       const restore = path.match(/^(?:\/api)?\/transactions\/([^/]+)\/restore$/);
-      if (restore && method === "POST") return response(await app.restoreTransaction(auth, requestId, decodeURIComponent(restore[1])));
+      if (restore && method === "POST") return response(await scopedApp.restoreTransaction(auth, requestId, decodeURIComponent(restore[1])));
       const transactionSettlement = path.match(/^(?:\/api)?\/transactions\/([^/]+)\/settle$/);
-      if (transactionSettlement && method === "POST") return response(await app.settle(auth, requestId, { ...parse(event), transactionId: decodeURIComponent(transactionSettlement[1]) }), 201);
+      if (transactionSettlement && method === "POST") return response(await scopedApp.settle(auth, requestId, { ...parse(event), transactionId: decodeURIComponent(transactionSettlement[1]) }), 201);
       const transaction = path.match(/^(?:\/api)?\/transactions\/([^/]+)$/);
       if (transaction) {
         const id = decodeURIComponent(transaction[1]);
         if (method === "GET")
-          return response(await app.getTransaction(auth, id));
+          return response(await scopedApp.getTransaction(auth, id));
         if (method === "DELETE")
-          return response(await app.deleteTransaction(auth, requestId, id));
-        if (method === "PUT") return response(await app.editTransaction(auth, requestId, id, parse(event)));
+          return response(await scopedApp.deleteTransaction(auth, requestId, id));
+        if (method === "PUT") return response(await scopedApp.editTransaction(auth, requestId, id, parse(event)));
       }
       if (path === "/api/settlements" && method === "POST")
-        return response(await app.settle(auth, requestId, parse(event)), 201);
+        return response(await scopedApp.settle(auth, requestId, parse(event)), 201);
       const members = path.match(/^\/api\/trips\/([^/]+)\/members\/([^/]+)$/);
       if (members && ["PUT", "DELETE"].includes(method))
         return response(
-          await app.member(
+          await scopedApp.member(
             auth,
             requestId,
             decodeURIComponent(members[1]),
@@ -260,7 +274,7 @@ export function createHandler(
       const tripHistory = path.match(/^\/api\/trips\/([^/]+)\/transactions$/);
       if (tripHistory && method === "GET")
         return response(
-          await app.tripHistory(auth, decodeURIComponent(tripHistory[1]), {
+          await scopedApp.tripHistory(auth, decodeURIComponent(tripHistory[1]), {
             cursor: query.cursor,
             limit: query.limit,
           }),
@@ -272,14 +286,14 @@ export function createHandler(
         const type = collection[1];
         if (method === "GET")
           return response(
-            await app.records(auth, type, {
+            await scopedApp.records(auth, type, {
               due: Boolean(collection[2]),
               cursor: query.cursor,
             }),
           );
         if (method === "POST" && !collection[2])
           return response(
-            await app.saveEntity(
+            await scopedApp.saveEntity(
               auth,
               requestId,
               type,
@@ -299,15 +313,15 @@ export function createHandler(
           operation === "process" &&
           method === "POST"
         )
-          return response(await app.processRecurring(auth, id));
+          return response(await scopedApp.processRecurring(auth, id));
         if (type === "recurring" && operation === "skip" && method === "POST")
-          return response(await app.skipRecurring(auth, requestId, id));
+          return response(await scopedApp.skipRecurring(auth, requestId, id));
         if (!operation && method === "PUT")
           return response(
-            await app.saveEntity(auth, requestId, type, id, parse(event)),
+            await scopedApp.saveEntity(auth, requestId, type, id, parse(event)),
           );
         if (!operation && method === "DELETE")
-          return response(await app.deleteEntity(auth, requestId, type, id));
+          return response(await scopedApp.deleteEntity(auth, requestId, type, id));
       }
       throw new ApiError(404, "Endpoint not found.");
     } catch (error) {
@@ -331,7 +345,15 @@ export function createHandler(
         },
         status,
       );
-    }
-  };
+    } finally { await adoption?.catch(() => {}); }
+  });
+}
+// Use the same signing-key cache as authenticate. Provisioned environments
+// finish this work during initialization, before their first user request.
+if (process.env.AWS_LAMBDA_INITIALIZATION_TYPE === "provisioned-concurrency") {
+  await Promise.allSettled([
+    warmSigningKeys(),
+    repository.get("data", { userId: "WARMUP#connection", recordId: "NOT_FOUND" }),
+  ]);
 }
 export const handler = createHandler();

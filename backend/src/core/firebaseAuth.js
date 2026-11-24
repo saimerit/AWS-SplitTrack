@@ -59,6 +59,7 @@ export class FirebaseKeyCache {
   }
 }
 const signingKeys = new FirebaseKeyCache();
+export const warmSigningKeys = () => signingKeys.get();
 
 export function validateFirebaseToken(
   token,
